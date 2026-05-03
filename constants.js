@@ -1,0 +1,41 @@
+(function () {
+  const MSG = Object.freeze({
+    ENSURE_OFFSCREEN: "ENSURE_OFFSCREEN",
+    START_SESSION: "START_SESSION",
+    STOP_SESSION: "STOP_SESSION",
+    APPLY_SETTINGS: "APPLY_SETTINGS",
+    GET_STATUS: "GET_STATUS",
+    START: "START",
+    STOP: "STOP",
+    STATE: "STATE",
+    ERROR: "ERROR",
+    OFFSCREEN_STATE: "OFFSCREEN_STATE",
+    OFFSCREEN_ERROR: "OFFSCREEN_ERROR",
+    OFFSCREEN_TRANSCRIPT: "OFFSCREEN_TRANSCRIPT",
+    OFFSCREEN_CLEAR_INTERIM: "OFFSCREEN_CLEAR_INTERIM",
+    OFFSCREEN_CLEAR_ALL: "OFFSCREEN_CLEAR_ALL",
+    DG_TRANSCRIPT: "DG_TRANSCRIPT",
+    CLEAR_INTERIM: "CLEAR_INTERIM",
+    CLEAR_ALL: "CLEAR_ALL",
+    REMOVE_OVERLAY: "REMOVE_OVERLAY",
+    PCM_CHUNK: "PCM_CHUNK"
+  });
+
+  const STATE = Object.freeze({
+    IDLE: "idle",
+    CREATING_OFFSCREEN: "creating_offscreen",
+    LOADING_VAD: "loading_vad",
+    LOADING_MODEL: "loading_model",
+    AWAITING_CAPTURE_PERMISSION: "awaiting_capture_permission",
+    CAPTURING: "capturing",
+    CONNECTING_DEEPGRAM: "connecting_deepgram",
+    LISTENING: "listening",
+    STOPPING: "stopping",
+    ERROR: "error"
+  });
+
+  globalThis.HIANIME = Object.freeze({
+    MSG,
+    STATE
+  });
+})();

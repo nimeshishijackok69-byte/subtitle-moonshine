@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Live Subtitles</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main class="popup">
+      <header class="header">
+        <div>
+          <h1>Live Subtitles</h1>
+          <p id="statusText" title="Idle">Idle</p>
+        </div>
+        <span id="statusDot" class="status-dot" aria-hidden="true"></span>
+      </header>
+
+      <section class="section">
+        <label class="field">
+          <span>Groq API Key (optional)</span>
+          <input id="apiKey" type="password" autocomplete="off" spellcheck="false" placeholder="gsk_..." title="Optional. Enables cloud fallback for difficult audio.">
+        </label>
+        <div class="button-row">
+          <button id="saveKey" type="button">Save</button>
+          <button id="clearKey" type="button" class="secondary">Clear Key</button>
+        </div>
+        <p id="keyHint" class="hint">Runs locally on your GPU. API key enables cloud accuracy boost.</p>
+      </section>
+
+      <section class="section controls">
+        <label class="range-field">
+          <span>Lines</span>
+          <strong id="linesValue">3</strong>
+          <input id="lines" type="range" min="3" max="3" step="1">
+        </label>
+
+        <label class="range-field">
+          <span>Font Size</span>
+          <strong id="fontSizeValue">32px</strong>
+          <input id="fontSize" type="range" min="20" max="48" step="1">
+        </label>
+
+        <label class="range-field">
+          <span>Background Opacity</span>
+          <strong id="opacityValue">45%</strong>
+          <input id="opacity" type="range" min="0.15" max="0.75" step="0.05">
+        </label>
+
+        <label class="checkbox-field">
+          <input id="showInterim" type="checkbox">
+          <span>Show interim line</span>
+        </label>
+      </section>
+
+      <section class="section actions">
+        <button id="start" type="button" class="primary">Start</button>
+        <button id="stop" type="button" class="danger">Stop</button>
+      </section>
+    </main>
+
+    <script src="constants.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>
