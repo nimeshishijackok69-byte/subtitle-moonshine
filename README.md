@@ -1,28 +1,31 @@
-# HiAnime — Live Japanese Subtitles (Chrome Extension)
+# HiAnime - Live Japanese Subtitles
 
-A Chrome extension (Manifest V3) that captures tab audio and streams it to [Deepgram](https://deepgram.com) for real-time Japanese speech-to-text transcription, displayed as an overlay on the page.
+A Chrome Manifest V3 extension that captures audio from a user-selected tab, runs local Japanese speech recognition, and renders selectable subtitles over the page.
 
----
+There is no API key, no server, and no cloud speech service. Audio stays on the machine. The only external dependency used at runtime is the bundled SenseVoice ONNX model plus Silero VAD and ONNX Runtime WebAssembly.
 
 ## Architecture
 
-The extension is split into 4 runtime contexts that communicate via `chrome.runtime.sendMessage`:
-
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                        Chrome Extension                             │
+│                         Chrome Extension                            │
 │                                                                     │
 │  ┌──────────────┐    ┌──────────────────┐    ┌───────────────────┐  │
-│  │  popup.html   │◄──►│  service_worker  │◄──►│  offscreen.html   │  │
-│  │  (popup UI)   │    │  (orchestrator)  │    │  (audio capture)  │  │
-│  └──────────────┘    └────────┬─────────┘    └───────────────────┘  │
-│                               │                         │           │
-│                               │                         │ audio-worklet.js
-│                               ▼                         ▼           │
-│                    ┌──────────────────┐    ┌───────────────────┐     │
-│                    │  contentScript   │    │   Deepgram WSS    │     │
-│                    │  (overlay DOM)   │    │  (STT streaming)  │     │
-│                    └──────────────────┘    └───────────────────┘     │
+│  │ popup.html   │◄──►│ service_worker   │◄──►│ offscreen.html    │  │
+│  │ controls     │    │ orchestrator     │    │ capture + ASR     │  │
+│  └──────────────┘    └────────┬─────────┘    └─────────┬─────────┘  │
+│                               │                        │            │
+│                               ▼                        ▼            │
+│                    ┌──────────────────┐    ┌───────────────────┐   │
+│                    │ contentScript    │    │ audio-worklet.js  │   │
+│                    │ subtitle overlay │    │ PCM conversion    │   │
+│                    └──────────────────┘    └───────────────────┘   │
+│                                                        │            │
+│                                              ┌─────────▼─────────┐  │
+│                                              │ SenseVoice ONNX   │  │
+│                                              │ Silero VAD ONNX   │  │
+│                                              │ ORT WebAssembly   │  │
+│                                              └───────────────────┘  │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -30,164 +33,158 @@ The extension is split into 4 runtime contexts that communicate via `chrome.runt
 
 | File | Role |
 |------|------|
-| `manifest.json` | Extension configuration — declares permissions, service worker, CSP |
-| `service_worker.js` | Background orchestrator — manages offscreen document lifecycle, relays messages between popup, offscreen, and content script |
-| `offscreen.html` | Blank HTML shell that loads `offscreen.js` |
-| `offscreen.js` | Audio capture logic — calls `getDisplayMedia`, creates AudioContext, connects to Deepgram WebSocket, forwards transcripts |
-| `audio-worklet.js` | AudioWorkletProcessor — downmixes multi-channel audio to mono, resamples to 16kHz, converts Float32 to Int16 PCM chunks |
-| `contentScript.js` | Injected into the target tab — renders a subtitle overlay (final lines + interim line) |
-| `popup.html` | Extension popup UI — API key input, settings sliders, Start/Stop buttons |
-| `popup.js` | Popup logic — loads/saves settings, sends commands to service worker, updates status indicator |
-| `popup.css` | Popup styling — light/dark mode, Teal accent color |
+| `manifest.json` | MV3 manifest: permissions, service worker, CSP, COI headers |
+| `service_worker.js` | Control plane: offscreen lifecycle, tab injection, message relay, reinjection |
+| `popup.html` / `popup.js` / `popup.css` | Popup UI, overlay settings, Start/Stop, status |
+| `offscreen.html` | Offscreen document shell |
+| `offscreen.js` | Capture, ring buffer, Silero VAD segmentation, SenseVoice inference, transcript events |
+| `audio-worklet.js` | Downmix, low-pass filter, resample to 16 kHz, Int16 PCM chunks |
+| `sensevoice-frontend.js` | JS Kaldi-style fbank + LFR + CMVN frontend for SenseVoice |
+| `contentScript.js` | In-page selectable subtitle overlay, drag/close controls |
+| `models/sensevoice/` | SenseVoice int8 model, tokens, CMVN/language config, license note |
+| `lib/` | ONNX Runtime WebAssembly, Silero VAD model |
 
----
+Legacy Moonshine files under `models/onnx/` and `models/tokenizer*` are no longer used by the runtime.
 
-## How it works
+## How It Works
 
-### 1. Audio Capture
+### 1. Start
 
-When the user clicks **Start**:
+1. The popup sends `START_SESSION` with the active tab id and overlay settings.
+2. The service worker clears the overlay, applies settings, creates the offscreen document, and sends `START`.
+3. The offscreen document loads Silero VAD, then loads SenseVoice.
+4. The user selects the tab to share through Chrome's picker.
+5. Once audio is available, the worklet emits 16 kHz mono Int16 chunks and the session moves to `listening`.
 
-1. **Popup** (`popup.js`) sends `START_SESSION` to the service worker with the tab ID and config (API key, overlay settings)
-2. **Service worker** (`service_worker.js`) injects the content script into the tab, creates an offscreen document
-3. **Offscreen document** (`offscreen.js`) calls `navigator.mediaDevices.getDisplayMedia()` with `preferCurrentTab: true` to capture the tab's audio
-4. The audio track is piped into an `AudioContext` → `AudioWorkletNode`
+### 2. Audio Pipeline
 
 ```
-getDisplayMedia({ audio: true, preferCurrentTab: true })
-  → MediaStream (audio track)
-  → AudioContext.createMediaStreamSource()
+Captured tab audio
+  → MediaStreamAudioSourceNode
   → AudioWorkletNode ("pcm-capture-processor")
-  → silence gain node → audioContext.destination
+  → silent GainNode
+  → AudioContext.destination
 ```
 
-### 2. PCM Conversion (audio-worklet.js)
+`audio-worklet.js`:
 
-The `PcmCaptureProcessor` AudioWorkletProcessor:
+- averages all input channels to mono
+- applies a 7.2 kHz low-pass filter
+- resamples to 16 kHz with streaming linear interpolation
+- converts Float32 to signed Int16
+- emits 25 ms PCM chunks (configurable through `chunkMs`)
 
-- **Downmixes** multi-channel audio to mono (averages all channels)
-- **Resamples** from the source sample rate to 16kHz using linear interpolation
-- **Converts** Float32 samples (-1 to 1) to Int16 (-32768 to 32767)
-- **Buffers** into chunks (default 40ms worth of samples) and posts them to the main thread
+The worklet does not perform VAD. All gating and segmentation happens in `offscreen.js`.
 
-### 3. Deepgram Streaming
+### 3. VAD Segmentation
 
-The offscreen document opens a WebSocket to `wss://api.deepgram.com/v1/listen`:
+`offscreen.js` keeps a 20-second PCM ring buffer. Silero VAD runs on 512-sample frames (32 ms at 16 kHz).
 
-- **Authentication**: `new WebSocket(url, ["token", apiKey])`
-- **Query params**: `language=ja`, `encoding=linear16`, `sample_rate=16000`, `interim_results=true`, `endpointing=250`
-- **Binary messages**: PCM Int16 chunks sent as `ArrayBuffer` via `ws.send()`
-- **Text responses**: JSON with transcript results — `is_final` for final utterances, `speech_final` for end of speech
+Current segmentation settings:
 
-Duplicate suppression: Skips forwarding if the text matches the last sent interim or final.
+| Setting | Value |
+|---------|-------|
+| Speech threshold | `0.5` |
+| Speech start confirmation | 2 consecutive frames |
+| Pre-roll before speech | 250 ms |
+| End-silence boundary | 260 ms |
+| Tail padding | 80 ms |
+| Minimum speech | 200 ms |
+| Minimum audio to decode | 250 ms |
+| Maximum utterance | 6 s |
 
-### 4. Transcript Relay
+A 6-second cap keeps subtitle lines short and bounds final-decode latency. If speech continues past the cap, the next speech run starts a new utterance.
 
-The service worker acts as a relay:
+### 4. SenseVoice Inference
 
-```
-offscreen.js → OFFSCREEN_TRANSCRIPT → service_worker.js → DG_TRANSCRIPT → contentScript.js
-```
+Each finished utterance is decoded once:
 
-- `OFFSCREEN_CLEAR_INTERIM` — clears the interim line when Deepgram sends a final result
-- `OFFSCREEN_CLEAR_ALL` — clears all lines (used at session start)
-- `OFFSCREEN_STATE` / `OFFSCREEN_ERROR` — forwards status/errors back to the popup
+1. `sensevoice-frontend.js` computes 80-bin fbank features at 16 kHz, applies LFR (window 7, shift 6), then CMVN.
+2. The resulting `[1, frames, 560]` float32 tensor is fed to `model.int8.onnx` with:
+   - `x_length`
+   - `language = 11` (`ja`)
+   - `text_norm = 14` (with inverse text normalization)
+3. Greedy CTC decoding collapses repeated tokens and drops blank id 0.
+4. Tokens are joined, `▁` becomes a space, and SenseVoice language/emotion/event tags are removed.
+5. Japanese inter-character spaces and spaces around Japanese punctuation are removed by `normalizeTranscript()`.
 
-### 5. Overlay Rendering (contentScript.js)
+The model and frontend were checked against the SenseVoice reference feature dump. Measured in an Edge extension page on this machine:
 
-The content script creates a fixed-position overlay at the bottom-center of the page:
+| Input | Inference time |
+|-------|----------------|
+| 2.0 s | ~247 ms |
+| 7.2 s | ~541 ms |
 
-- **Final lines**: A scrollable buffer of completed utterances (default 4 lines, configurable 3–6)
-- **Interim line**: Italic, semi-transparent — shows live, partial transcription
-- **Settings**: Font size (20–48px), background opacity (15–75%), show/hide interim toggle
-- **Persistence**: Settings are saved to `chrome.storage.local` and restored on popup open
-- **Auto-reinjection**: If the tab navigates/reloads, the service worker re-injects the content script and reapplies settings
+The extension uses 4 ORT WASM threads when `crossOriginIsolated` is true, otherwise 1. The 4-thread path depends on the COI headers in `manifest.json`.
 
----
+### 5. Interim and Final Subtitles
 
-## Setup & Usage
+- A provisional decode is scheduled 1.2 seconds after speech starts.
+- It sends one `isFinal: false` event per utterance, and only if **Show interim line** is enabled.
+- When the utterance ends, the provisional timer is cancelled and the final decode is queued.
+- Final text is sent as `isFinal: true` and committed to the overlay history.
+- Identical consecutive final lines are allowed; there is no global duplicate suppression.
 
-### Prerequisites
+### 6. Overlay
 
-- **Chrome 116+** (required for `offscreen` API and `chrome.runtime.getContexts`)
-- **Deepgram API key** — sign up at [deepgram.com](https://deepgram.com) (free $200 credit, no credit card required for trial)
+`contentScript.js` renders ordinary DOM text so Yomitan and similar tools can inspect it.
 
-### Installation
+- default 3 final lines
+- font size 20-48 px
+- background opacity 15-75%
+- optional interim line
+- draggable and removable
+- settings stored in `chrome.storage.local` under `overlay.*`
+- re-injected after tab navigation/reload while a session is active
 
-1. Open Chrome and navigate to `chrome://extensions`
-2. Enable **Developer mode** (toggle in top-right corner)
-3. Click **"Load unpacked"**
-4. Select the `hianime` folder
-5. The extension icon should appear in the toolbar
+The overlay uses reused nodes and updates `textContent` in place instead of rebuilding the whole DOM on every transcript event.
 
-### Usage
+## Setup
 
-1. Navigate to any site with Japanese audio (e.g., Crunchyroll, Netflix, YouTube)
-2. Click the extension icon to open the popup
-3. Enter your Deepgram API key and click **Save**
-4. Adjust overlay settings (lines, font size, opacity, interim toggle)
-5. Click **Start**
-6. In the screen-sharing prompt, select the tab (choose the current tab or any tab playing audio)
-7. Subtitles will appear at the bottom of the page
+### Requirements
 
-### Notes
+- Chrome/Edge 116+
+- Git LFS for the SenseVoice model
 
-- Check **"Share audio"** is enabled in the screen-sharing dialog
-- The extension captures system audio from the selected tab — the tab does not need to be visible as long as audio is playing
-- All processing happens locally in the browser; only the PCM audio is sent to Deepgram's servers
-- The API key is stored in `chrome.storage.local` (not synced to other devices)
+### Clone
 
----
-
-## Data Flow Diagram
-
-```
-User clicks "Start"
-  │
-  ▼
-popup.js: startSession()
-  │ sends START_SESSION { tabId, config }
-  ▼
-service_worker.js: startSession()
-  │ 1. Injects contentScript.js into tab
-  │ 2. Sends CLEAR_ALL, APPLY_SETTINGS to content script
-  │ 3. Creates offscreen document (offscreen.html)
-  │ 4. Sends START { tabId, config } to offscreen
-  ▼
-offscreen.js: startSession()
-  │ 1. setState("awaiting_capture_permission")
-  │ 2. getDisplayMedia({ audio: true, preferCurrentTab: true })
-  │ 3. setState("capturing")
-  │ 4. Creates AudioContext → loads audio-worklet.js
-  │ 5. Connects: sourceNode → workletNode → silenceNode → destination
-  │ 6. setState("connecting_deepgram")
-  │ 7. Opens WebSocket to Deepgram
-  ▼
-Deepgram connection established
-  │ setState("listening")
-  ▼
-audio-worklet.js: process()
-  │ Downmix → Resample → Float32→Int16 → Buffer → postMessage("PCM_CHUNK")
-  ▼
-offscreen.js: workletNode.port.onmessage
-  │ ws.send(chunk)  ──────►  Deepgram STT
-  │                           │
-  │                     ◄──── ws.onmessage: { channel: { alternatives: [{ transcript }] }, is_final, speech_final }
-  ▼
-offscreen.js: forwardTranscript()
-  │ sends OFFSCREEN_TRANSCRIPT { tabId, event }
-  ▼
-service_worker.js: handles OFFSCREEN_TRANSCRIPT
-  │ sends DG_TRANSCRIPT { isFinal, text, ts } to tab
-  ▼
-contentScript.js: handles DG_TRANSCRIPT
-  │ isFinal → commitFinal(): push to finalLines[], re-render
-  │ !isFinal → renderInterim(): update interimNode textContent
-  ▼
-User sees subtitles on the page
+```powershell
+git lfs install
+git clone https://github.com/nimeshishijackok69-byte/subtitle-moonshine.git
+cd subtitle-moonshine
+git lfs pull
 ```
 
----
+`models/sensevoice/model.int8.onnx` is approximately 239 MB and is stored with Git LFS. If it is only a small pointer file, run `git lfs pull`.
+
+### Load the extension
+
+1. Open `chrome://extensions` (or `edge://extensions`).
+2. Enable **Developer mode**.
+3. Click **Load unpacked**.
+4. Select this repository folder.
+5. Open the popup, choose overlay settings, and click **Start**.
+6. In the share picker, select the tab playing Japanese audio and enable **Share audio**.
+
+No Deepgram or Groq API key is needed. There is no key field in the popup.
+
+## Runtime States
+
+```
+idle
+  → creating_offscreen
+  → loading_vad
+  → loading_model
+  → awaiting_capture_permission
+  → capturing
+  → listening
+  → stopping
+  → idle
+
+any active state → error
+```
+
+The popup displays the current state. The service worker closes the offscreen document when the session reaches `idle` or `error`.
 
 ## Message Types
 
@@ -195,65 +192,73 @@ User sees subtitles on the page
 
 | Type | Payload | Description |
 |------|---------|-------------|
-| `GET_STATUS` | — | Get current session state |
-| `ENSURE_OFFSCREEN` | — | Ensure offscreen document exists |
-| `START_SESSION` | `{ tabId, config }` | Start a new transcription session |
-| `STOP_SESSION` | — | Stop the active session |
-| `APPLY_SETTINGS` | `{ tabId, config }` | Update overlay settings on the tab |
+| `GET_STATUS` | - | Return current state and tab id |
+| `ENSURE_OFFSCREEN` | - | Query/prepare the offscreen document |
+| `START_SESSION` | `{ tabId, config }` | Start capture and transcription |
+| `STOP_SESSION` | - | Stop the active session |
+| `APPLY_SETTINGS` | `{ tabId, config }` | Update overlay settings |
 
 ### Service Worker → Offscreen
 
 | Type | Payload | Description |
 |------|---------|-------------|
-| `START` | `{ tabId, config }` | Start audio capture + Deepgram connection |
-| `STOP` | — | Stop capture, close WebSocket, clean up |
+| `START` | `{ tabId, config }` | Load models and begin capture |
+| `STOP` | - | Stop capture, flush the active utterance, clean up |
 
 ### Offscreen → Service Worker
 
 | Type | Payload | Description |
 |------|---------|-------------|
-| `OFFSCREEN_STATE` | `{ state }` | Report current state for popup status |
-| `OFFSCREEN_ERROR` | `{ code, message }` | Report error for popup display |
-| `OFFSCREEN_TRANSCRIPT` | `{ tabId, event }` | Forward transcript text to the tab |
-| `OFFSCREEN_CLEAR_INTERIM` | `{ tabId }` | Clear the interim line on the tab |
-| `OFFSCREEN_CLEAR_ALL` | `{ tabId }` | Clear all subtitle lines on the tab |
+| `OFFSCREEN_STATE` | `{ state }` | Session state update |
+| `OFFSCREEN_ERROR` | `{ code, message }` | User-facing error |
+| `OFFSCREEN_TRANSCRIPT` | `{ tabId, event }` | Interim or final transcript |
+| `OFFSCREEN_CLEAR_INTERIM` | `{ tabId }` | Clear the interim line |
+| `OFFSCREEN_CLEAR_ALL` | `{ tabId }` | Clear all subtitle lines |
 
 ### Service Worker → Content Script
 
 | Type | Payload | Description |
 |------|---------|-------------|
-| `APPLY_SETTINGS` | `{ config }` | Update overlay dimensions, font, opacity |
-| `DG_TRANSCRIPT` | `{ isFinal, text, ts }` | Display a transcript line |
-| `CLEAR_INTERIM` | — | Clear the interim (partial) line |
-| `CLEAR_ALL` | — | Clear all subtitle lines |
+| `APPLY_SETTINGS` | `{ config }` | Update overlay appearance |
+| `DG_TRANSCRIPT` | `{ isFinal, text, ts }` | Display transcript text |
+| `CLEAR_INTERIM` | - | Clear the interim line |
+| `CLEAR_ALL` | - | Clear all lines |
+| `REMOVE_OVERLAY` | - | Remove the overlay |
 
 ### Service Worker → Popup
 
 | Type | Payload | Description |
 |------|---------|-------------|
-| `STATE` | `{ state }` | Update the popup status indicator |
-| `ERROR` | `{ code, message }` | Display error in the popup |
+| `STATE` | `{ state }` | Update status indicator |
+| `ERROR` | `{ code, message }` | Display an error |
 
----
+`DG_TRANSCRIPT` is a legacy message name; it now carries local SenseVoice output, not Deepgram output.
 
-## State Machine
+## Storage
 
-```
-idle → creating_offscreen → awaiting_capture_permission → capturing → connecting_deepgram → listening
-                                                                                                      │
-                                                                                                      ▼
-listening → stopping → idle
-listening → error (on WebSocket close / auth failure)
-     any → error (on unexpected failure)
-```
+`chrome.storage.local` stores only overlay settings:
 
-States tracked in `currentState` on the service worker and forwarded to the popup.
+- `overlay.lines`
+- `overlay.fontSize`
+- `overlay.opacity`
+- `overlay.showInterim`
 
----
+Session state, tab id, drag position, and transcript history are runtime-only.
 
-## Key Design Decisions
+## Design Notes
 
-- **Offscreen document instead of service worker**: Chrome MV3 service workers have short lifetimes and can't use `getDisplayMedia`. The offscreen API provides a persistent DOM-free page for media capture.
-- **AudioWorklet instead of ScriptProcessor**: AudioWorklet runs on a separate audio thread, avoiding audio glitches. It's the modern replacement for the deprecated `ScriptProcessorNode`.
-- **`preferCurrentTab`**: New in Chrome 116, avoids the cumbersome "this tab / other tab" UI. Falls back to standard getDisplayMedia on older versions.
-- **Deepgram WebSocket with token auth**: Uses the `["token", apiKey]` WebSocket protocol, keeping the API key out of the URL query string.
+- **Offscreen document** is used because MV3 service workers cannot reliably own long-lived media capture and Web Audio.
+- **AudioWorklet** keeps resampling and PCM conversion off the main thread.
+- **Silero VAD plus a ring buffer** avoids sending silence and gives utterance boundaries without a cloud endpointing service.
+- **One provisional decode per utterance** provides early feedback without repeatedly re-decoding the same speech.
+- **Local ONNX model** removes API keys, network transcription, and provider rate limits.
+- **Selectable DOM text** is intentional for Yomitan compatibility.
+
+## Known Limitations
+
+- A real tab-audio end-to-end session still needs manual browser testing with Chrome's share picker.
+- The 6-second utterance cap can cut a very long continuous sentence at a non-linguistic boundary.
+- A final decode is queued behind an in-flight provisional decode; stopping speech immediately after the 1.2-second interim can add a small amount of final latency.
+- No automated end-to-end audio test exists yet.
+- The SenseVoice license note in `models/sensevoice/LICENSE` should be reviewed before redistributing the model.
+- `context.md` and `implementation_plan.md` are historical documents and do not describe the current local model pipeline.

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Hianime Live Japanese Subtitles",
-  "description": "Live Japanese subtitles using local Moonshine AI (WebGPU) with Groq Whisper fallback and Silero VAD.",
+  "description": "Live Japanese subtitles using a local speech model and Silero VAD.",
   "version": "0.3.0",
   "minimum_chrome_version": "116",
   "permissions": [
@@ -20,17 +20,13 @@
     "default_popup": "popup.html"
   },
   "content_security_policy": {
-    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; connect-src https://api.groq.com;"
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; connect-src 'self'; worker-src 'self';"
   },
-  "web_accessible_resources": [
-    {
-      "resources": [
-        "lib/*",
-        "models/*",
-        "models/onnx/*"
-      ],
-      "matches": ["<all_urls>"]
-    }
-  ]
+  "cross_origin_embedder_policy": {
+    "value": "require-corp"
+  },
+  "cross_origin_opener_policy": {
+    "value": "same-origin"
+  }
 }
 

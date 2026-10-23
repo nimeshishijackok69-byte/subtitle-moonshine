@@ -1,7 +1,6 @@
 const { MSG, STATE } = globalThis.HIANIME;
 
 const DEFAULTS = {
-  groqApiKey: "",
   "overlay.lines": 3,
   "overlay.fontSize": 32,
   "overlay.opacity": 0.45,
@@ -12,10 +11,9 @@ const STATUS_LABELS = {
   [STATE.IDLE]: "Idle",
   [STATE.CREATING_OFFSCREEN]: "Preparing audio engine",
   [STATE.LOADING_VAD]: "Loading neural voice detector...",
-  [STATE.LOADING_MODEL]: "Loading Moonshine model on GPU...",
+  [STATE.LOADING_MODEL]: "Loading local speech model...",
   [STATE.AWAITING_CAPTURE_PERMISSION]: "Waiting for tab selection",
   [STATE.CAPTURING]: "Capturing audio",
-  [STATE.CONNECTING_DEEPGRAM]: "Connecting...",
   [STATE.LISTENING]: "Listening (local AI + VAD)",
   [STATE.STOPPING]: "Stopping",
   [STATE.ERROR]: "Error"
@@ -27,16 +25,11 @@ const ACTIVE_SESSION_STATES = new Set([
   STATE.LOADING_MODEL,
   STATE.AWAITING_CAPTURE_PERMISSION,
   STATE.CAPTURING,
-  STATE.CONNECTING_DEEPGRAM,
   STATE.LISTENING,
   STATE.STOPPING
 ]);
 
 const els = {
-  apiKey: document.getElementById("apiKey"),
-  saveKey: document.getElementById("saveKey"),
-  clearKey: document.getElementById("clearKey"),
-  keyHint: document.getElementById("keyHint"),
   lines: document.getElementById("lines"),
   linesValue: document.getElementById("linesValue"),
   fontSize: document.getElementById("fontSize"),
@@ -60,33 +53,18 @@ function storageSet(values) {
   return chrome.storage.local.set(values);
 }
 
-function storageRemove(keys) {
-  return chrome.storage.local.remove(keys);
-}
-
 function getOverlayConfig() {
   return {
-    lines: 3,
+    lines: Number(els.lines.value),
     fontSize: Number(els.fontSize.value),
     opacity: Number(els.opacity.value),
     showInterim: els.showInterim.checked,
-    chunkMs: 25,
-    vadHangoverMs: 150,
-    vadPreRollMs: 120
+    chunkMs: 25
   };
-}
-
-function getApiKey() {
-  return els.apiKey.value.trim();
 }
 
 function getSessionConfig() {
-  return {
-    ...getOverlayConfig(),
-    apiKey: getApiKey(),
-    language: "ja",
-    model: "whisper-large-v3"
-  };
+  return getOverlayConfig();
 }
 
 function getPersistedOverlaySettings() {
@@ -106,12 +84,9 @@ function updateValueLabels() {
 }
 
 function updateStartState() {
-  const key = getApiKey();
-  const hasValidApiKey = key.length === 0 || isApiKeyUsable(key);
   const isBusy = ACTIVE_SESSION_STATES.has(els.statusDot.dataset.state || STATE.IDLE);
   els.start.disabled = isBusy;
   els.stop.disabled = !isBusy;
-  els.apiKey.classList.toggle("invalid", key.length > 0 && !isApiKeyUsable(key));
 }
 
 function setStatus(state, detail = "") {
@@ -122,10 +97,6 @@ function setStatus(state, detail = "") {
   els.statusDot.classList.toggle("live", state === STATE.LISTENING);
   els.statusDot.classList.toggle("error", state === STATE.ERROR);
   updateStartState();
-}
-
-function isApiKeyUsable(key) {
-  return key.length > 0 && (key.startsWith("gsk_") || key.length >= 20);
 }
 
 async function getActiveTabId() {
@@ -145,35 +116,8 @@ async function persistOverlaySettings() {
   await storageSet(getPersistedOverlaySettings());
 }
 
-async function persistApiKey() {
-  const apiKey = getApiKey();
-  if (apiKey && !isApiKeyUsable(apiKey)) {
-    els.keyHint.textContent = "That key does not look like a Groq API key.";
-    updateStartState();
-    return;
-  }
-
-  await storageSet({ groqApiKey: apiKey });
-  els.keyHint.textContent = apiKey ? "Saved locally." : "Enter a Groq API key to start.";
-  els.saveKey.classList.add("saved");
-  window.setTimeout(() => els.saveKey.classList.remove("saved"), 900);
-  updateStartState();
-}
-
 async function persistAllSettings() {
-  const apiKey = getApiKey();
-  if (apiKey && !isApiKeyUsable(apiKey)) {
-    els.keyHint.textContent = "That key does not look like a Groq API key.";
-    updateStartState();
-    return false;
-  }
-
-  await storageSet({
-    groqApiKey: apiKey,
-    ...getPersistedOverlaySettings()
-  });
-  els.keyHint.textContent = apiKey ? "Saved locally." : "Enter a Groq API key to start.";
-  updateStartState();
+  await storageSet(getPersistedOverlaySettings());
   return true;
 }
 
@@ -202,12 +146,6 @@ async function applyOverlaySettingsToTab() {
 
 async function startSession() {
   const config = getSessionConfig();
-
-  if (config.apiKey && !isApiKeyUsable(config.apiKey)) {
-    setStatus(STATE.ERROR, "API key format looks wrong");
-    return;
-  }
-
   const saved = await persistAllSettings();
   if (!saved) {
     return;
@@ -243,9 +181,6 @@ async function load() {
     ...DEFAULTS,
     ...(await storageGet(Object.keys(DEFAULTS)))
   };
-  values["overlay.lines"] = 3;
-
-  els.apiKey.value = values.groqApiKey || "";
   els.lines.value = values["overlay.lines"];
   els.fontSize.value = values["overlay.fontSize"];
   els.opacity.value = values["overlay.opacity"];
@@ -260,23 +195,6 @@ async function load() {
   }
 
 }
-
-els.saveKey.addEventListener("click", () => {
-  persistApiKey().catch((error) => setStatus(STATE.ERROR, error.message));
-});
-
-els.clearKey.addEventListener("click", async () => {
-  els.apiKey.value = "";
-  window.clearTimeout(overlaySaveTimer);
-  await storageRemove(["groqApiKey"]);
-  els.keyHint.textContent = "Key cleared.";
-  updateStartState();
-});
-
-els.apiKey.addEventListener("input", () => {
-  els.keyHint.textContent = getApiKey() ? "Unsaved API key changes." : "Enter a Groq API key to start.";
-  updateStartState();
-});
 
 for (const input of [els.lines, els.fontSize, els.opacity, els.showInterim]) {
   input.addEventListener("input", () => {

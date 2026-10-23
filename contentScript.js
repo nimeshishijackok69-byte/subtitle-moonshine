@@ -241,7 +241,7 @@
 
   function commitFinal(text) {
     const cleanText = text.trim();
-    if (!cleanText || state.finalLines[state.finalLines.length - 1] === cleanText) {
+    if (!cleanText) {
       return;
     }
 

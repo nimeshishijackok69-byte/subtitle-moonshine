@@ -28,7 +28,6 @@
     LOADING_MODEL: "loading_model",
     AWAITING_CAPTURE_PERMISSION: "awaiting_capture_permission",
     CAPTURING: "capturing",
-    CONNECTING_DEEPGRAM: "connecting_deepgram",
     LISTENING: "listening",
     STOPPING: "stopping",
     ERROR: "error"
