@@ -191,7 +191,10 @@ async function stopSession() {
 
 async function applySettings({ tabId, config }) {
   lastOverlayConfig = config;
-  const targetTabId = tabId || activeTabId;
+  // A running session owns the overlay. The popup's tab is only the fallback
+  // before a session starts; preferring it would inject an idle overlay into
+  // whatever tab the popup happens to be on and leave the transcribed tab stale.
+  const targetTabId = activeTabId || tabId;
 
   if (targetTabId) {
     await ensureOverlayAndSend(targetTabId, {
@@ -265,9 +268,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       case MSG.OFFSCREEN_TRANSCRIPT:
         await ensureOverlayAndSend(message.tabId, {
           type: MSG.DG_TRANSCRIPT,
+          action: message.event.action,
+          lineId: message.event.lineId,
           isFinal: message.event.isFinal,
           text: message.event.text,
-          ts: message.event.ts
+          ts: message.event.ts,
+          telemetry: message.event.telemetry
         });
         return { ok: true };
 

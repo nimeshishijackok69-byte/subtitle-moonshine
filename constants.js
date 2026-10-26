@@ -15,6 +15,12 @@
     OFFSCREEN_CLEAR_INTERIM: "OFFSCREEN_CLEAR_INTERIM",
     OFFSCREEN_CLEAR_ALL: "OFFSCREEN_CLEAR_ALL",
     DG_TRANSCRIPT: "DG_TRANSCRIPT",
+    // Wire values for the committer's `action` field. These are the literal
+    // strings offscreen.js sends and contentScript.js switches on.
+    TRANSCRIPT_GROW: "GROW",
+    TRANSCRIPT_REVISE: "REVISE",
+    TRANSCRIPT_FINAL: "FINAL",
+    TRANSCRIPT_INTERIM: "INTERIM",
     CLEAR_INTERIM: "CLEAR_INTERIM",
     CLEAR_ALL: "CLEAR_ALL",
     REMOVE_OVERLAY: "REMOVE_OVERLAY",

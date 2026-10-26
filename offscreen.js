@@ -2,24 +2,32 @@ const { MSG, STATE } = globalThis.HIANIME;
 
 const TARGET_SAMPLE_RATE = 16000;
 const VAD_FRAME_SAMPLES = 512;
-const VAD_SPEECH_THRESHOLD = 0.5;
+const VAD_CONTEXT_SAMPLES = 64; // Silero v5 reference wrapper carries 64 samples of left context
+const VAD_SPEECH_THRESHOLD = 0.50; // Speech onset threshold
+const VAD_CONTINUE_THRESHOLD = 0.35; // Keeps a decaying tail attached to the utterance
+const VAD_SPEECH_ONSET_FRAMES = 3; // 3 consecutive frames (~96ms) to trigger onset
+const END_SILENCE_SAMPLES = Math.round(0.64 * TARGET_SAMPLE_RATE); // 0.64s silence closes utterance (10,240 samples)
+const ANCHOR_PREROLL_SAMPLES = Math.round(0.30 * TARGET_SAMPLE_RATE); // 0.30s anchor preroll (4,800 samples)
+const TAIL_PAD_SAMPLES = Math.round(0.20 * TARGET_SAMPLE_RATE); // 0.20s tail pad (3,200 samples)
+// Decode window floor. The window spans ANCHOR_PREROLL (0.3 s) + speech +
+// TAIL_PAD (0.2 s), so 1.0 s of window is ~0.5 s of actual speech. Shorter
+// bursts are dropped without being decoded: sub-0.5 s decodes are where the
+// `あ。` / `はい。` hallucinations in the live CSVs came from. Deliberate floor.
+const MIN_UTTERANCE_SAMPLES = Math.round(1.0 * TARGET_SAMPLE_RATE);
+const MAX_UTTERANCE_SAMPLES = Math.round(8.0 * TARGET_SAMPLE_RATE); // 8.0s cap per utterance
+const DECODE_STEP_MS = 750; // 750ms progressive anchored decode cadence
+const HOLDBACK_CHARS = 4; // 4 characters holdback for local agreement
+const ASR_STOP_TIMEOUT_MS = 2000; // upper bound on awaiting a decode during stop
 const RING_BUFFER_SECONDS = 20;
 const RING_BUFFER_SAMPLES = RING_BUFFER_SECONDS * TARGET_SAMPLE_RATE;
-const PRE_ROLL_SAMPLES = Math.round(0.25 * TARGET_SAMPLE_RATE);
-const END_SILENCE_SAMPLES = Math.round(0.26 * TARGET_SAMPLE_RATE);
-const TAIL_PAD_SAMPLES = Math.round(0.08 * TARGET_SAMPLE_RATE);
-const MIN_SPEECH_SAMPLES = Math.round(0.2 * TARGET_SAMPLE_RATE);
-const MIN_DECODE_SAMPLES = Math.round(0.25 * TARGET_SAMPLE_RATE);
-const MAX_UTTERANCE_SAMPLES = Math.round(6 * TARGET_SAMPLE_RATE);
-const PROVISIONAL_DELAY_MS = 1200;
 const ASR_WASM_THREADS = globalThis.crossOriginIsolated ? 4 : 1;
 
 let session = null;
 let intentionalStop = false;
 let offscreenState = STATE.IDLE;
 
-// ─── Silero VAD ─────────────────────────────────────────────────────
-let vadSession = null, vadState = null, vadSr = null, vadLoaded = false;
+// ─── Silero VAD (Fixed 576-sample layout with 64-sample rolling context) ───
+let vadSession = null, vadState = null, vadSr = null, vadContext = null, vadLoaded = false;
 
 async function loadVad() {
   if (vadLoaded) return;
@@ -29,19 +37,28 @@ async function loadVad() {
   vadSession = await ort.InferenceSession.create(
     chrome.runtime.getURL("lib/silero_vad.onnx"), { executionProviders: ["wasm"] }
   );
-  // This bundled Silero model uses a single recurrent `state` tensor.
-  vadState = new ort.Tensor("float32", new Float32Array(2 * 1 * 128), [2, 1, 128]);
+  resetVadState();
   vadSr = new ort.Tensor("int64", BigInt64Array.from([BigInt(TARGET_SAMPLE_RATE)]), []);
   vadLoaded = true;
 }
 
-function resetVadState() { if (vadState) vadState.data.fill(0); }
+function resetVadState() {
+  vadState = new ort.Tensor("float32", new Float32Array(2 * 1 * 128), [2, 1, 128]);
+  vadContext = new Float32Array(VAD_CONTEXT_SAMPLES);
+}
 
 async function runVad(float32Audio) {
   if (!vadSession) return 1.0;
-  const input = new ort.Tensor("float32", float32Audio, [1, float32Audio.length]);
-  const r = await vadSession.run({ input, state: vadState, sr: vadSr });
+  const input = new Float32Array(VAD_CONTEXT_SAMPLES + float32Audio.length);
+  input.set(vadContext, 0);
+  input.set(float32Audio, VAD_CONTEXT_SAMPLES);
+  const r = await vadSession.run({
+    input: new ort.Tensor("float32", input, [1, input.length]),
+    state: vadState,
+    sr: vadSr
+  });
   vadState = r.stateN;
+  vadContext.set(float32Audio.subarray(float32Audio.length - VAD_CONTEXT_SAMPLES));
   return r.output.data[0];
 }
 
@@ -54,8 +71,12 @@ const SENSEVOICE_FRONTEND = "models/sensevoice/frontend.json";
 function parseTokenTable(text) {
   const map = new Map();
   for (const line of text.split(/\r?\n/)) {
-    const match = line.match(/^(.+) (\d+)$/);
-    if (match) map.set(Number(match[2]), match[1]);
+    const idx = line.lastIndexOf(" ");
+    if (idx !== -1) {
+      const token = line.slice(0, idx);
+      const id = Number(line.slice(idx + 1));
+      if (!Number.isNaN(id)) map.set(id, token);
+    }
   }
   return map;
 }
@@ -106,7 +127,7 @@ function decodeSenseVoice(logits) {
 async function runAsr(pcm) {
   if (!asrSession || !asrFrontend) return null;
   const features = asrFrontend.computeFeatures(pcm);
-  if (!features.frames) return null;
+  if (!features?.frames) return null;
 
   const feeds = {
     x: new ort.Tensor("float32", features.data, [1, features.frames, features.dim]),
@@ -157,16 +178,31 @@ function createSegmenter() {
     candidateStart: -1,
     speechRun: 0,
     speechStart: 0,
-    utteranceStart: 0,
+    anchorStart: 0,
     lastSpeechEnd: 0,
-    silenceSamples: 0,
-    token: 0
+    silenceSamples: 0
   };
 }
 
-const JP_CHAR = "\\p{Script=Han}\\p{Script=Hiragana}\\p{Script=Katakana}\\u30FC";
-const JP_SPACE_RE = new RegExp(`(?<=[${JP_CHAR}])\\s+(?=[${JP_CHAR}])`, "gu");
-const JP_AFTER_PUNCT_RE = new RegExp(`([、。！？!?])\\s+(?=[${JP_CHAR}])`, "gu");
+function getLongestCommonPrefix(a, b) {
+  if (!a || !b) return 0;
+  const maxLen = Math.min(a.length, b.length);
+  let i = 0;
+  while (i < maxLen && a[i] === b[i]) i++;
+  return i;
+}
+
+// Lookbehind rather than a capture group: a consuming pattern only matches
+// every *other* gap in a run like `そう だ ね`, because the character after the
+// first gap is eaten as group 2 and can no longer serve as the next lookbehind
+// anchor. Zero-width assertions keep every gap independently matchable.
+// U+30FC (ー) is Script=Common, not Katakana, so it has to be listed or words
+// like `コーヒー を` keep a stray space.
+const JP_CHAR = "[\\p{Script=Han}\\p{Script=Hiragana}\\p{Script=Katakana}\\u30FC]";
+const JP_SPACE_RE = new RegExp(`(?<=${JP_CHAR})\\s+(?=${JP_CHAR})`, "gu");
+// Only collapse the gap after Japanese punctuation when Japanese follows, so
+// mixed text like `え？ What` keeps its space.
+const JP_AFTER_PUNCT_RE = new RegExp(`([、。！？!?])\\s+(?=${JP_CHAR})`, "gu");
 
 function normalizeTranscript(text) {
   let value = String(text || "").normalize("NFKC").trim();
@@ -185,86 +221,155 @@ function isUsableTranscript(text) {
   return true;
 }
 
-function enqueueUtterance(current, pcm) {
-  current.decodeQueue = current.decodeQueue
-    .then(() => transcribeUtterance(current, pcm))
-    .catch((error) => {
-      if (session === current && !intentionalStop) {
-        reportError("TRANSCRIBE_ERROR", error.message);
-      }
-    });
+// ─── Anchored Committer Pipeline ───────────────────────────────────
+// Every ASR call is serialized through one promise chain per session. A
+// progressive tick and the utterance-final flush can otherwise overlap on the
+// same ONNX session, and the losing decode then delivers its GROW/INTERIM
+// *after* FINAL, which rewrites an already-finalized line on the overlay.
+function withAsrLock(current, task) {
+  const run = current.asrChain.then(task, task);
+  current.asrChain = run.then(() => {}, () => {});
+  return run;
 }
 
-function clearProvisional(current) {
-  if (current.partialTimer) {
-    clearTimeout(current.partialTimer);
-    current.partialTimer = null;
-  }
+// One telemetry shape for every emission. `audioSamples` is the absolute ring
+// position the decode actually covers (the end of the audio, not the start):
+// the overlay can only show text once that audio has been captured, so the
+// audible delay is measured against it, not against the decode start.
+function telemetryFor(current, audioSamples, captureEpoch, asrDurationMs) {
+  return {
+    audioSeconds: Math.round((audioSamples / TARGET_SAMPLE_RATE) * 100) / 100,
+    capturedAt: captureEpoch,
+    streamStartEpoch: current.streamStartEpoch || null,
+    asrDurationMs,
+    wallClock: new Date().toLocaleTimeString()
+  };
 }
 
-function scheduleProvisional(current, token) {
-  clearProvisional(current);
-  if (current.config?.showInterim === false) return;
+async function tickAnchoredUtterance(current) {
+  const u = current.utterance;
+  if (!u || u.isDecoding || u.closed || !asrLoaded || session !== current || intentionalStop || current.stopping) return;
 
-  current.partialTimer = setTimeout(() => {
-    current.partialTimer = null;
-    if (session !== current || intentionalStop || current.stopping) return;
+  const now = current.ring.total;
+  const windowLen = Math.min(now - u.anchorStart, MAX_UTTERANCE_SAMPLES);
+  if (windowLen < MIN_UTTERANCE_SAMPLES) return;
 
-    const segmenter = current.segmenter;
-    if (!segmenter.speechActive || segmenter.token !== token) return;
-    if (segmenter.lastSpeechEnd - segmenter.utteranceStart < MIN_DECODE_SAMPLES) return;
+  const pcm = current.ring.read(u.anchorStart, u.anchorStart + windowLen);
+  if (!pcm || pcm.length < MIN_UTTERANCE_SAMPLES) return;
 
-    current.decodeQueue = current.decodeQueue
-      .then(() => transcribeProvisional(current, token))
-      .catch((error) => {
-        if (session === current && !intentionalStop) {
-          reportError("TRANSCRIBE_ERROR", error.message);
-        }
+  // Report the audio the decode actually covers. Once the 8 s cap is hit this
+  // is behind ring.total, and using ring.total would name audio never decoded.
+  const decodedEnd = u.anchorStart + windowLen;
+
+  u.isDecoding = true;
+  const tAsrStart = performance.now();
+  const captureEpoch = Date.now();
+  try {
+    const raw = await withAsrLock(current, () => runAsr(pcm));
+    const tAsrEnd = performance.now();
+    const asrDurationMs = Math.round((tAsrEnd - tAsrStart) * 10) / 10;
+    const text = normalizeTranscript(raw);
+    if (!isUsableTranscript(text)) return;
+    // A final flush claimed this utterance while we were decoding; it owns the line now.
+    if (u.closed) return;
+
+    const k = getLongestCommonPrefix(u.prevText, text);
+    const upTo = Math.min(k, text.length - HOLDBACK_CHARS);
+
+    if (upTo > u.committed.length) {
+      u.committed = text.slice(0, upTo);
+      await forwardTranscript(current.tabId, {
+        action: MSG.TRANSCRIPT_GROW,
+        lineId: u.lineId,
+        text: u.committed,
+        isFinal: false,
+        telemetry: telemetryFor(current, decodedEnd, captureEpoch, asrDurationMs)
       });
-  }, PROVISIONAL_DELAY_MS);
-}
+    } else if (getLongestCommonPrefix(text, u.committed) < u.committed.length) {
+      // Shrink only to the prefix the two decodes actually agree on. Bounding by
+      // the old committed length instead would publish fresh, unagreed text and
+      // skip the holdback entirely.
+      const agreed = getLongestCommonPrefix(text, u.committed);
+      u.committed = text.slice(0, agreed);
+      await forwardTranscript(current.tabId, {
+        action: MSG.TRANSCRIPT_REVISE,
+        lineId: u.lineId,
+        text: u.committed,
+        isFinal: false,
+        telemetry: telemetryFor(current, decodedEnd, captureEpoch, asrDurationMs)
+      });
+    }
 
-async function transcribeProvisional(current, token) {
-  if (session !== current || intentionalStop || current.stopping || !asrLoaded) return;
+    const interimTail = text.slice(u.committed.length).trim();
+    await forwardTranscript(current.tabId, {
+      action: MSG.TRANSCRIPT_INTERIM,
+      lineId: u.lineId,
+      text: interimTail,
+      isFinal: false,
+      telemetry: telemetryFor(current, decodedEnd, captureEpoch, asrDurationMs)
+    });
 
-  const segmenter = current.segmenter;
-  if (!segmenter.speechActive || segmenter.token !== token) return;
-
-  const pcm = current.ring.read(segmenter.utteranceStart, segmenter.lastSpeechEnd);
-  if (!pcm || pcm.length < MIN_DECODE_SAMPLES) return;
-
-  const text = normalizeTranscript(await runAsr(pcm));
-  if (!isUsableTranscript(text)) return;
-  if (session !== current || intentionalStop || !segmenter.speechActive || segmenter.token !== token) {
-    return;
+    u.prevText = text;
+  } catch (err) {
+    console.warn("[AnchoredCommitter] Decode error:", err);
+  } finally {
+    u.isDecoding = false;
   }
-
-  await forwardTranscript(current.tabId, { text, isFinal: false, ts: Date.now() });
 }
 
-function finishUtterance(current, endAbs) {
+async function finishUtterance(current, endAbs) {
+  const u = current.utterance;
   const segmenter = current.segmenter;
-  if (!segmenter.speechActive) return;
-  clearProvisional(current);
-
-  const start = segmenter.utteranceStart;
-  const end = Math.min(
-    endAbs,
-    segmenter.lastSpeechEnd + TAIL_PAD_SAMPLES,
-    current.ring.total
-  );
-  const speechSamples = segmenter.lastSpeechEnd - segmenter.speechStart;
-
   segmenter.speechActive = false;
   segmenter.candidateStart = -1;
   segmenter.speechRun = 0;
   segmenter.silenceSamples = 0;
+  resetVadState();
 
-  if (speechSamples < MIN_SPEECH_SAMPLES || end - start < MIN_DECODE_SAMPLES) return;
+  if (u) u.closed = true;
+  if (u?.timer) { clearInterval(u.timer); u.timer = null; }
+  current.utterance = null;
 
-  const pcm = current.ring.read(start, end);
-  if (!pcm || pcm.length < MIN_DECODE_SAMPLES) return;
-  enqueueUtterance(current, pcm);
+  if (!u) return;
+
+  const end = Math.min(
+    endAbs + TAIL_PAD_SAMPLES,
+    u.anchorStart + MAX_UTTERANCE_SAMPLES,
+    current.ring.total
+  );
+  const len = end - u.anchorStart;
+  if (len < MIN_UTTERANCE_SAMPLES) return;
+
+  const pcm = current.ring.read(u.anchorStart, end);
+  if (!pcm || pcm.length < MIN_UTTERANCE_SAMPLES) return;
+
+  const tAsrStart = performance.now();
+  const captureEpoch = Date.now();
+  try {
+    const raw = await withAsrLock(current, () => runAsr(pcm));
+    const tAsrEnd = performance.now();
+    const asrDurationMs = Math.round((tAsrEnd - tAsrStart) * 10) / 10;
+    const text = normalizeTranscript(raw);
+
+    // The stop path awaits this flush, so `intentionalStop` is still false here.
+    // If it is set, the session is gone and this line must not reach the overlay.
+    if (session !== current || intentionalStop) return;
+
+    // An unusable final decode must still close the line. Emitting nothing would
+    // leave the last GROW/INTERIM text on the overlay indefinitely, in a slot
+    // that no later FINAL ever clears.
+    const finalText = isUsableTranscript(text) ? text : u.committed;
+
+    await forwardTranscript(current.tabId, {
+      action: MSG.TRANSCRIPT_FINAL,
+      lineId: u.lineId,
+      text: finalText,
+      isFinal: true,
+      telemetry: telemetryFor(current, end, captureEpoch, asrDurationMs)
+    });
+  } catch (err) {
+    console.warn("[AnchoredCommitter] Final flush error:", err);
+  }
 }
 
 function handleVadFrame(current, probability, frameStart, frameEnd) {
@@ -274,14 +379,23 @@ function handleVadFrame(current, probability, frameStart, frameEnd) {
     if (probability >= VAD_SPEECH_THRESHOLD) {
       if (segmenter.speechRun === 0) segmenter.candidateStart = frameStart;
       segmenter.speechRun += 1;
-      if (segmenter.speechRun >= 2) {
+      if (segmenter.speechRun >= VAD_SPEECH_ONSET_FRAMES) {
         segmenter.speechActive = true;
-        segmenter.token += 1;
         segmenter.speechStart = segmenter.candidateStart;
-        segmenter.utteranceStart = Math.max(0, segmenter.candidateStart - PRE_ROLL_SAMPLES);
+        segmenter.anchorStart = Math.max(0, segmenter.candidateStart - ANCHOR_PREROLL_SAMPLES);
         segmenter.lastSpeechEnd = frameEnd;
         segmenter.silenceSamples = 0;
-        scheduleProvisional(current, segmenter.token);
+
+        current.utterance = {
+          lineId: Date.now() + "_" + Math.random().toString(36).slice(2, 6),
+          anchorStart: segmenter.anchorStart,
+          committed: "",
+          prevText: "",
+          isDecoding: false,
+          closed: false,
+          timer: null
+        };
+        current.utterance.timer = setInterval(() => tickAnchoredUtterance(current), DECODE_STEP_MS);
       }
     } else {
       segmenter.speechRun = 0;
@@ -290,7 +404,8 @@ function handleVadFrame(current, probability, frameStart, frameEnd) {
     return;
   }
 
-  if (probability >= VAD_SPEECH_THRESHOLD) {
+  // Speech active: update end and silence
+  if (probability >= VAD_CONTINUE_THRESHOLD) {
     segmenter.lastSpeechEnd = frameEnd;
     segmenter.silenceSamples = 0;
   } else {
@@ -299,9 +414,11 @@ function handleVadFrame(current, probability, frameStart, frameEnd) {
 
   if (
     segmenter.silenceSamples >= END_SILENCE_SAMPLES ||
-    frameEnd - segmenter.utteranceStart >= MAX_UTTERANCE_SAMPLES
+    frameEnd - segmenter.anchorStart >= MAX_UTTERANCE_SAMPLES
   ) {
-    finishUtterance(current, frameEnd);
+    // Track the flush so a stop arriving mid-decode can await it instead of
+    // racing it, and so its FINAL is not orphaned after the session is torn down.
+    current.flushTask = finishUtterance(current, segmenter.lastSpeechEnd);
   }
 }
 
@@ -317,6 +434,8 @@ function enqueuePcm(current, arrayBuffer) {
 
 async function processPcmChunk(current, arrayBuffer) {
   if (session !== current || intentionalStop || current.stopping) return;
+
+  if (!current.streamStartEpoch) current.streamStartEpoch = Date.now();
 
   const int16 = new Int16Array(arrayBuffer);
   current.ring.append(int16);
@@ -364,7 +483,7 @@ function getStatus() {
 }
 
 async function forwardTranscript(tabId, event) {
-  if (!event?.text) return;
+  if (!event) return;
   await sendMsg({
     type: MSG.OFFSCREEN_TRANSCRIPT,
     tabId,
@@ -372,21 +491,9 @@ async function forwardTranscript(tabId, event) {
   });
 }
 
-async function transcribeUtterance(current, pcm) {
-  if (session !== current || intentionalStop) return;
-
-  let text = null;
-  if (asrLoaded) text = await runAsr(pcm);
-  text = normalizeTranscript(text);
-  if (!isUsableTranscript(text)) return;
-
-  if (session !== current || intentionalStop) return;
-  await forwardTranscript(current.tabId, { text, isFinal: true, ts: Date.now() });
-}
-
 // ─── Session lifecycle ──────────────────────────────────────────────
 async function disposeSessionResources(cur) {
-  clearProvisional(cur);
+  if (cur.utterance?.timer) { clearInterval(cur.utterance.timer); cur.utterance.timer = null; }
   try { cur.workletNode?.port?.close(); cur.sourceNode?.disconnect();
     cur.workletNode?.disconnect(); cur.silenceNode?.disconnect(); } catch{}
   try { if(cur.audioContext?.state!=="closed") await cur.audioContext.close(); } catch{}
@@ -401,12 +508,23 @@ async function stopSession(options={}) {
   cur.stopping = true;
   await setState(STATE.STOPPING);
 
+  // A decode must never be able to wedge teardown: a stalled ONNX call would
+  // otherwise leave `session` non-null and every later START blocked behind it.
+  const bounded = (task) => Promise.race([
+    task.catch(() => {}),
+    new Promise((resolve) => setTimeout(resolve, ASR_STOP_TIMEOUT_MS))
+  ]);
+
+  // A silence-triggered flush may already be decoding. Await it so its FINAL is
+  // not orphaned, then flush anything still open.
+  if (cur.flushTask) {
+    await bounded(cur.flushTask);
+    cur.flushTask = null;
+  }
+
+  // Authoritative flush of active utterance on stop
   if (finalState === STATE.IDLE && cur.segmenter?.speechActive) {
-    finishUtterance(cur, cur.ring.total);
-    await Promise.race([
-      cur.decodeQueue || Promise.resolve(),
-      new Promise((resolve) => setTimeout(resolve, 2000))
-    ]);
+    await bounded(finishUtterance(cur, cur.ring.total));
   }
 
   intentionalStop = true;
@@ -451,7 +569,8 @@ async function startSession(tabId, config) {
     await setState(STATE.CAPTURING);
     audioContext = new AudioContext();
     await audioContext.audioWorklet.addModule(chrome.runtime.getURL("audio-worklet.js"));
-    const sourceNode = audioContext.createMediaStreamSource(new MediaStream([audioTrack]));
+    const captureStream = new MediaStream([audioTrack]);
+    const sourceNode = audioContext.createMediaStreamSource(captureStream);
     const workletNode = new AudioWorkletNode(audioContext, "pcm-capture-processor", {
       numberOfInputs:1, numberOfOutputs:1, outputChannelCount:[1],
       processorOptions: {
@@ -463,14 +582,20 @@ async function startSession(tabId, config) {
     silenceNode.connect(audioContext.destination);
 
     session = {
-      tabId, config, displayStream, audioContext, sourceNode, workletNode, silenceNode,
+      tabId, config, displayStream, captureStream, audioContext, sourceNode, workletNode, silenceNode,
       ring: createRingBuffer(RING_BUFFER_SAMPLES),
       segmenter: createSegmenter(),
       vadPending: new Int16Array(0),
       vadAbs: 0,
+      // Epoch of the first captured PCM chunk. Audio position 0 of the ring
+      // buffer maps to this wall-clock instant, so (capturedAt - streamStartEpoch)
+      // minus the decoded audio position yields how far behind real time the
+      // pipeline is running.
+      streamStartEpoch: 0,
       pcmQueue: Promise.resolve(),
-      decodeQueue: Promise.resolve(),
-      partialTimer: null,
+      asrChain: Promise.resolve(),
+      utterance: null,
+      flushTask: null,
       stopping: false
     };
     const current = session;
