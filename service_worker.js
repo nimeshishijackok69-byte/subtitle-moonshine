@@ -8,6 +8,32 @@ let activeTabId = null;
 let currentState = STATE.IDLE;
 let lastOverlayConfig = null;
 let lastTabMessageError = "";
+const OFFSCREEN_KEEP_WARM_MS = 5 * 60 * 1000;
+let offscreenTeardownTimer = null;
+
+function scheduleOffscreenTeardown() {
+  cancelOffscreenTeardown();
+  offscreenTeardownTimer = setTimeout(async () => {
+    try {
+      if (currentState === STATE.IDLE) {
+        await closeOffscreenDocumentIfPresent();
+      }
+    } catch (err) {
+      // The ERROR path may have closed the document between the existence check
+      // and closeDocument(). Do not leave an unhandled rejection in the worker.
+      console.warn("[Offscreen] deferred teardown failed:", err);
+    } finally {
+      offscreenTeardownTimer = null;
+    }
+  }, OFFSCREEN_KEEP_WARM_MS);
+}
+
+function cancelOffscreenTeardown() {
+  if (offscreenTeardownTimer) {
+    clearTimeout(offscreenTeardownTimer);
+    offscreenTeardownTimer = null;
+  }
+}
 
 async function getOffscreenContexts() {
   const offscreenUrl = chrome.runtime.getURL(OFFSCREEN_DOCUMENT);
@@ -125,6 +151,7 @@ async function ensureOverlayAndSend(tabId, message) {
 }
 
 async function startSession({ tabId, config }) {
+  cancelOffscreenTeardown();
   const liveStatus = await getLiveOffscreenStatus();
   if (liveStatus?.hasSession && liveStatus.state !== STATE.IDLE && liveStatus.state !== STATE.ERROR) {
     return {
@@ -133,8 +160,8 @@ async function startSession({ tabId, config }) {
     };
   }
 
-  const offscreenExists = await hasOffscreenDocument();
-  if (currentState === STATE.ERROR || liveStatus?.state === STATE.ERROR || offscreenExists) {
+  // Only close if corrupted in error state; keep warm document alive
+  if (currentState === STATE.ERROR || liveStatus?.state === STATE.ERROR) {
     await closeOffscreenDocumentIfPresent();
     activeTabId = null;
     currentState = STATE.IDLE;
@@ -240,17 +267,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         currentState = message.state;
         if (message.state === STATE.IDLE) {
           activeTabId = null;
+          scheduleOffscreenTeardown();
+        } else {
+          cancelOffscreenTeardown();
         }
         chrome.runtime.sendMessage({
           type: MSG.STATE,
           state: message.state
         }).catch(() => {});
-        if (message.state === STATE.IDLE || message.state === STATE.ERROR) {
+        if (message.state === STATE.ERROR) {
           await closeOffscreenDocumentIfPresent();
         }
         return { ok: true };
 
       case MSG.OFFSCREEN_ERROR:
+        cancelOffscreenTeardown();
         currentState = STATE.ERROR;
         activeTabId = null;
         chrome.runtime.sendMessage({
@@ -272,6 +303,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           lineId: message.event.lineId,
           isFinal: message.event.isFinal,
           text: message.event.text,
+          tail: message.event.tail,
           ts: message.event.ts,
           telemetry: message.event.telemetry
         });

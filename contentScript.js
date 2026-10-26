@@ -541,12 +541,11 @@
       if (action === ACTION.GROW || action === ACTION.REVISE) {
         state.activeLineId = lineId;
         state.activeLineText = text;
-        // The previous tick's tail is now partly committed; drop it rather than
-        // showing it twice. The INTERIM that follows this tick repopulates it.
-        state.interimTail = "";
+        // If atomic tail is supplied, update committed prefix and interim tail together in one paint
+        state.interimTail = state.settings.showInterim && message.tail != null ? message.tail : "";
         renderLines();
       } else if (action === ACTION.INTERIM) {
-        state.interimTail = state.settings.showInterim ? text : "";
+        state.interimTail = state.settings.showInterim ? (message.tail != null ? message.tail : text) : "";
         renderLines();
       } else if (action === ACTION.FINAL) {
         if (message.lineId) state.finalizedLineId = message.lineId;

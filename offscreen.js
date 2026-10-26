@@ -10,9 +10,10 @@ const END_SILENCE_SAMPLES = Math.round(0.64 * TARGET_SAMPLE_RATE); // 0.64s sile
 const ANCHOR_PREROLL_SAMPLES = Math.round(0.30 * TARGET_SAMPLE_RATE); // 0.30s anchor preroll (4,800 samples)
 const TAIL_PAD_SAMPLES = Math.round(0.20 * TARGET_SAMPLE_RATE); // 0.20s tail pad (3,200 samples)
 // Decode window floor. The window spans ANCHOR_PREROLL (0.3 s) + speech +
-// TAIL_PAD (0.2 s), so 1.0 s of window is ~0.5 s of actual speech. Shorter
-// bursts are dropped without being decoded: sub-0.5 s decodes are where the
-// `あ。` / `はい。` hallucinations in the live CSVs came from. Deliberate floor.
+// TAIL_PAD (0.2 s), so 1.0 s of window is ~0.5 s of actual speech. A shorter
+// window is widened backwards into the ring (or left-padded with silence at
+// stream start) rather than dropped: `はい` / `ただ。` / `それから？` are real
+// speech, and the CTC encoder needs buffer length, not speech duration.
 const MIN_UTTERANCE_SAMPLES = Math.round(1.0 * TARGET_SAMPLE_RATE);
 const MAX_UTTERANCE_SAMPLES = Math.round(8.0 * TARGET_SAMPLE_RATE); // 8.0s cap per utterance
 const DECODE_STEP_MS = 750; // 750ms progressive anchored decode cadence
@@ -275,39 +276,47 @@ async function tickAnchoredUtterance(current) {
 
     const k = getLongestCommonPrefix(u.prevText, text);
     const upTo = Math.min(k, text.length - HOLDBACK_CHARS);
+    const agreed = getLongestCommonPrefix(text, u.committed);
 
+    // Decide the committed prefix first, then derive the tail from it. Deriving
+    // the tail against the *previous* committed length would re-publish the
+    // characters this tick just committed on a GROW, and drop the characters a
+    // REVISE removed. Either way the row no longer reconstructs the decode.
+    let nextCommitted = u.committed;
+    let action = MSG.TRANSCRIPT_INTERIM;
     if (upTo > u.committed.length) {
-      u.committed = text.slice(0, upTo);
-      await forwardTranscript(current.tabId, {
-        action: MSG.TRANSCRIPT_GROW,
-        lineId: u.lineId,
-        text: u.committed,
-        isFinal: false,
-        telemetry: telemetryFor(current, decodedEnd, captureEpoch, asrDurationMs)
-      });
-    } else if (getLongestCommonPrefix(text, u.committed) < u.committed.length) {
-      // Shrink only to the prefix the two decodes actually agree on. Bounding by
-      // the old committed length instead would publish fresh, unagreed text and
-      // skip the holdback entirely.
-      const agreed = getLongestCommonPrefix(text, u.committed);
-      u.committed = text.slice(0, agreed);
-      await forwardTranscript(current.tabId, {
-        action: MSG.TRANSCRIPT_REVISE,
-        lineId: u.lineId,
-        text: u.committed,
-        isFinal: false,
-        telemetry: telemetryFor(current, decodedEnd, captureEpoch, asrDurationMs)
-      });
+      nextCommitted = text.slice(0, upTo);
+      action = MSG.TRANSCRIPT_GROW;
+    } else if (agreed < u.committed.length) {
+      nextCommitted = text.slice(0, agreed);
+      action = MSG.TRANSCRIPT_REVISE;
     }
 
-    const interimTail = text.slice(u.committed.length).trim();
-    await forwardTranscript(current.tabId, {
-      action: MSG.TRANSCRIPT_INTERIM,
-      lineId: u.lineId,
-      text: interimTail,
-      isFinal: false,
-      telemetry: telemetryFor(current, decodedEnd, captureEpoch, asrDurationMs)
-    });
+    // No trim: a leading space is part of the decode, and trimming it would make
+    // `text + tail` differ from the decode when a commit boundary lands on a gap.
+    const interimTail = text.slice(nextCommitted.length);
+    const telemetry = telemetryFor(current, decodedEnd, captureEpoch, asrDurationMs);
+
+    if (action === MSG.TRANSCRIPT_INTERIM) {
+      await forwardTranscript(current.tabId, {
+        action,
+        lineId: u.lineId,
+        text: interimTail,
+        tail: interimTail,
+        isFinal: false,
+        telemetry
+      });
+    } else {
+      u.committed = nextCommitted;
+      await forwardTranscript(current.tabId, {
+        action,
+        lineId: u.lineId,
+        text: u.committed,
+        tail: interimTail,
+        isFinal: false,
+        telemetry
+      });
+    }
 
     u.prevText = text;
   } catch (err) {
@@ -337,11 +346,33 @@ async function finishUtterance(current, endAbs) {
     u.anchorStart + MAX_UTTERANCE_SAMPLES,
     current.ring.total
   );
-  const len = end - u.anchorStart;
-  if (len < MIN_UTTERANCE_SAMPLES) return;
+  let start = u.anchorStart;
 
-  const pcm = current.ring.read(u.anchorStart, end);
-  if (!pcm || pcm.length < MIN_UTTERANCE_SAMPLES) return;
+  // A short window is widened backwards into the ring so the encoder gets its
+  // receptive field, instead of dropping the utterance. `read()` already clamps
+  // the request to the oldest retained sample, so no separate bound is needed;
+  // anything still short (stream start) is padded on the left below.
+  if (end - start < MIN_UTTERANCE_SAMPLES) {
+    start = end - MIN_UTTERANCE_SAMPLES;
+  }
+
+  // Never widen back past the previous flush. That audio was already decoded
+  // into the previous line, and re-decoding it here would let this FINAL absorb
+  // and re-print the previous sentence. The left-pad below covers the shortfall.
+  if (current.lastFlushEnd) start = Math.max(start, current.lastFlushEnd);
+  if (start >= end) start = end - 1;
+  current.lastFlushEnd = end;
+
+  let pcm = current.ring.read(start, end);
+  if (!pcm || pcm.length === 0) return;
+
+  // If at the start of the stream and audio is still shorter than MIN_UTTERANCE_SAMPLES,
+  // pad with silence on the left to satisfy SenseVoice's receptive field.
+  if (pcm.length < MIN_UTTERANCE_SAMPLES) {
+    const padded = new Int16Array(MIN_UTTERANCE_SAMPLES);
+    padded.set(pcm, MIN_UTTERANCE_SAMPLES - pcm.length);
+    pcm = padded;
+  }
 
   const tAsrStart = performance.now();
   const captureEpoch = Date.now();
@@ -596,6 +627,7 @@ async function startSession(tabId, config) {
       asrChain: Promise.resolve(),
       utterance: null,
       flushTask: null,
+      lastFlushEnd: 0,
       stopping: false
     };
     const current = session;

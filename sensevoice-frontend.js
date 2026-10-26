@@ -101,6 +101,7 @@
       this.window = buildWindow();
       this.re = new Float64Array(FFT_SIZE);
       this.im = new Float64Array(FFT_SIZE);
+      this.power = new Float64Array(FFT_SIZE / 2 + 1);
       this.frame = new Float64Array(FRAME_LENGTH);
     }
 
@@ -134,7 +135,7 @@
         }
 
         this.fft();
-        const power = new Float64Array(FFT_SIZE / 2 + 1);
+        const power = this.power;
         for (let i = 0; i < power.length; i += 1) {
           power[i] = this.re[i] * this.re[i] + this.im[i] * this.im[i];
         }

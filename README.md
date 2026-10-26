@@ -69,10 +69,12 @@ Captured tab audio
 `audio-worklet.js`:
 
 - averages all input channels to mono
-- applies a 7.2 kHz low-pass filter
+- applies a 4th-order Butterworth low-pass at 7.5 kHz (two biquads, Direct Form II Transposed) as the anti-aliasing filter
 - resamples to 16 kHz with streaming linear interpolation
 - converts Float32 to signed Int16
 - emits 25 ms PCM chunks (configurable through `chunkMs`)
+
+The filter replaces a 1-pole RC section at 7.2 kHz, which was only −8.8 dB at 16 kHz. The cascaded design is −40.9 dB at 16 kHz and −67.5 dB at 20 kHz, so content that folds back into the voice band is attenuated rather than aliased in. At the 8 kHz Nyquist point the attenuation is −4.6 dB, so the band just above Nyquist is still only lightly filtered; the improvement is above ~10 kHz.
 
 The worklet does not perform VAD. All gating and segmentation happens in `offscreen.js`.
 
@@ -90,10 +92,12 @@ Current segmentation settings:
 | End-silence boundary | 640 ms |
 | Speech-continuation threshold | `0.35` |
 | Tail padding | 200 ms |
-| Minimum utterance | 1.0 s |
+| Minimum decode window | 1.0 s (widened backwards, not dropped) |
 | Maximum utterance | 8 s |
 
 An utterance is anchored: the left edge is fixed at the VAD onset minus the pre-roll and never moves, and the right edge grows while speech continues. An 8-second cap bounds final-decode latency; if speech runs past it the utterance is flushed and the next one starts immediately.
+
+The 1.0 s floor is a property of the decode window, not a filter on speech. The window is 0.3 s pre-roll + speech + 0.2 s tail, so a 0.2 s exclamation yields a 0.7 s window; the final decode widens it backwards into the ring buffer, or left-pads with silence at stream start, so the CTC encoder always receives at least 1.0 s. On `benchmark_16k.wav` the three sub-0.5 s bursts the old code discarded (`やらない。`, `ただ?`, `それから?`) all decode correctly at a 1.0 s window. Widening further is not free: at 2.0 s the window reaches into the previous line and the decode absorbs it (`だと思います、ただ。`), so the floor stays at 1.0 s.
 
 ### 4. SenseVoice Inference
 
@@ -123,10 +127,12 @@ Each utterance is decoded repeatedly while it is still being spoken, always over
 
 | Event | Meaning |
 |-------|---------|
-| `GROW` | The committed prefix extended; rewrite the line in place |
-| `REVISE` | A later decode disagreed with already-committed text; rewrite it |
+| `GROW` | The committed prefix extended; rewrite the line in place, with the new tail |
+| `REVISE` | A later decode disagreed with already-committed text; rewrite it, with the new tail |
 | `INTERIM` | The unstable remainder after the committed prefix |
 | `FINAL` | Utterance ended; the line is authoritative and joins the history |
+
+`GROW` and `REVISE` carry the unstable tail in the same message, so one paint updates both the committed text and the dimmed remainder. Sending the tail as a separate `INTERIM` meant two IPC hops and two layouts per 750 ms tick, and the intermediate frame showed the committed text with no tail.
 
 Two rules keep the committed text stable:
 
@@ -198,7 +204,7 @@ idle
 any active state → error
 ```
 
-The popup displays the current state. The service worker closes the offscreen document when the session reaches `idle` or `error`.
+The popup displays the current state. The service worker closes the offscreen document on `error`. On `idle` it keeps the document warm for five minutes so a restart does not re-compile the 239 MB model. That timer is a `setTimeout`, which does not survive service-worker termination (~30 s idle), so the document can stay resident until the extension is reloaded — a known gap, not a guarantee.
 
 ## Message Types
 
@@ -231,14 +237,14 @@ The popup displays the current state. The service worker closes the offscreen do
 | `OFFSCREEN_CLEAR_INTERIM` | `{ tabId }` | Clear the interim line |
 | `OFFSCREEN_CLEAR_ALL` | `{ tabId }` | Clear all subtitle lines |
 
-`event` is `{ action, lineId, text, isFinal, ts, telemetry }`. `action` is one of the `MSG.TRANSCRIPT_*` constants, whose values are the wire strings `GROW`, `REVISE`, `INTERIM`, `FINAL`; `lineId` identifies the utterance being rewritten.
+`event` is `{ action, lineId, text, tail, isFinal, ts, telemetry }`. `action` is one of the `MSG.TRANSCRIPT_*` constants, whose values are the wire strings `GROW`, `REVISE`, `INTERIM`, `FINAL`; `lineId` identifies the utterance being rewritten. `tail` is the unstable remainder after the committed prefix, sent in the same message as `GROW`/`REVISE` so the row is painted once instead of twice.
 
 ### Service Worker → Content Script
 
 | Type | Payload | Description |
 |------|---------|-------------|
 | `APPLY_SETTINGS` | `{ config }` | Update overlay appearance |
-| `DG_TRANSCRIPT` | `{ action, lineId, isFinal, text, ts, telemetry }` | Committer event for one line |
+| `DG_TRANSCRIPT` | `{ action, lineId, isFinal, text, tail, ts, telemetry }` | Committer event for one line |
 | `CLEAR_INTERIM` | - | Clear the interim line |
 | `CLEAR_ALL` | - | Clear all lines and reset telemetry |
 | `REMOVE_OVERLAY` | - | Remove the overlay |
