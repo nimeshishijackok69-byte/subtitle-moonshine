@@ -144,23 +144,6 @@ async function applyOverlaySettingsToTab() {
   }
 }
 
-async function requestOriginGrant(tabId) {
-  // Least privilege: instead of <all_urls> at install time, ask for the
-  // transcribed origin only. The optional-permission doorhanger can CLOSE
-  // this popup (long-standing Chromium behavior), destroying this context
-  // mid-flow, so startSession dispatches the session first and this runs
-  // afterwards in the same gesture turn without further awaits before it.
-  try {
-    const [tab] = await chrome.tabs.get(tabId);
-    if (!tab?.url || !/^https?:/i.test(tab.url)) return;
-    await chrome.permissions.request({ origins: [`${new URL(tab.url).origin}/*`] });
-  } catch {
-    // Declined, gesture lost, or a non-http(s) tab (chrome://, file://): the
-    // activeTab grant from the popup click still covers this tab's initial
-    // injection; the origin grant only future-proofs re-injection.
-  }
-}
-
 async function startSession() {
   const config = getSessionConfig();
   const saved = await persistAllSettings();
@@ -171,22 +154,24 @@ async function startSession() {
   const tabId = await getActiveTabId();
   setStatus(STATE.CREATING_OFFSCREEN);
 
-  // Dispatch FIRST: never serialize the session behind the permission prompt,
-  // because the doorhanger can close this popup and destroy its JS context
-  // before the await resumes (see requestOriginGrant). The grant is then
-  // requested while the start is already in flight.
-  const starting = chrome.runtime.sendMessage({
+  // NOTE: no chrome.permissions.request here on purpose. Chrome MV3's user
+  // gesture ends at this handler's first await, so permissions.request called
+  // after the storage/tab lookups above always rejects with "This function
+  // must be called during a user gesture" — it would be dead code with a
+  // silently swallowed rejection. Injection therefore relies on the
+  // activeTab grant from this popup click. If subtitles should survive
+  // cross-origin navigation, grant the site manually (address-bar padlock
+  // icon > Site settings, or chrome://settings/content/all): the manifest
+  // declares optional_host_permissions for exactly that.
+  const response = await chrome.runtime.sendMessage({
     type: MSG.START_SESSION,
     tabId,
     config
-  }).then((response) => {
-    if (!response?.ok) {
-      throw new Error(response?.error || "Unable to start session.");
-    }
   });
 
-  await requestOriginGrant(tabId);
-  await starting;
+  if (!response?.ok) {
+    throw new Error(response?.error || "Unable to start session.");
+  }
 }
 
 async function stopSession() {

@@ -153,7 +153,7 @@ Every ASR call on a session is serialised through one promise chain. A progressi
 - optional interim text
 - draggable and removable
 - settings stored in `chrome.storage.local` under `overlay.*`
-- re-injected after tab navigation/reload while a session is active
+- re-injected after same-origin navigation/reload while a session is active (the `activeTab` grant covers the tab you clicked Start on; navigating to a different site drops the overlay — press Start again, or pre-grant that site via Chrome's site settings so re-injection always works)
 
 The overlay is exactly `overlay.lines` rows at all times. The active utterance occupies the last row and carries its unstable tail inline as a dimmed span, so a sentence never straddles two rows and the box never gains or loses a row mid-session. A long row can still wrap to a second visual line. Rows are reused and only their text nodes are touched, so a 750 ms tick does not rebuild the DOM.
 
@@ -273,9 +273,9 @@ Session state, tab id, drag position, and transcript history are runtime-only.
 
 ## Telemetry
 
-The content script keeps the last 1000 committer events in memory. `window.__dgTelemetry.downloadCsv()` writes the raw events to a CSV. Both `getStats()` and `downloadCsv()` are reachable from the page console through a main-world bridge.
+The content script keeps the last 1000 committer events in memory, in the extension's isolated world only. There is no page-world bridge: an inline script exposing `getStats()`/`downloadCsv()` would be readable by every page script and would hand pages a page-triggered download capability, so none is created on purpose. To inspect telemetry, open DevTools and switch the JavaScript context to the extension (Chrome 130+: the "JavaScript context: Extension" entry) — `getStats()` and `downloadCsv()` are callable there, and every `FINAL` row is also `console.log`ged natively.
 
-The bridge is asynchronous by construction: the page world cannot read extension memory, so `getStats()` dispatches a request event and returns whatever the previous reply cached (or `"Calculating stats (logged below)..."` on the first call). The extension side then `console.table`s the fresh result. Statistics cover `FINAL` rows only — interim decodes are in the CSV but are not part of the percentiles.
+You can also run `getStats()` from that context; it returns the percentile summary synchronously. Statistics cover `FINAL` rows only — interim decodes are in the CSV but are not part of the percentiles.
 
 | Column | Meaning |
 |--------|---------|
@@ -312,7 +312,7 @@ Telemetry resets on `CLEAR_ALL`, so a new session's CSV does not contain the pre
 - Committed text is stable but not always correct: a misrecognition that survives local agreement and the 4-character holdback stays on screen until the utterance ends.
 - Short interjections (`あ。`, `はい。`) are the main hallucination residue in a live run; they are not currently suppressed.
 - The first committed text for an utterance lands roughly 2 s after speech starts (onset confirmation + one decode tick + holdback).
-- The telemetry bridge runs in the page's main world, so a script on the page can call `window.__dgTelemetry.downloadCsv()` and trigger a file download. It cannot read extension memory directly; everything it sees is what the bridge publishes.
+- Telemetry is accessible only from the extension's own DevTools context; nothing about it is exposed to page scripts (this is deliberate — see Telemetry).
 - No automated end-to-end audio test exists yet.
 - The SenseVoice license note in `models/sensevoice/LICENSE` should be reviewed before redistributing the model.
 - `context.md` and `implementation_plan.md` are historical documents and do not describe the current local model pipeline.

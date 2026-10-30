@@ -44,20 +44,51 @@ foreach ($bin in @($onnx, $vad, $wasm)) {
 $mib = [math]::Round((Get-Item $onnx).Length/1MB, 1)
 Write-Host "Package binary assertions OK (model.int8.onnx ~ $mib MB)"
 
-$stage = Join-Path $env:TEMP "cws-stage-$([guid]::NewGuid().ToString('N'))"
-New-Item -ItemType Directory -Path $stage | Out-Null
+# Build the archive entry-by-entry with explicit '/' entry names. Neither
+# Compress-Archive nor ZipFile::CreateFromDirectory (on the .NET Framework
+# that Windows PowerShell 5.1 hosts) is safe here: both have written '\'
+# separators, which violates APPNOTE 4.4.17.1 - CWS rejects it and POSIX
+# unzips extract literal "lib\ort.min.js" files that break the extension.
+Add-Type -AssemblyName System.IO.Compression
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+$mode = [System.IO.Compression.ZipArchiveMode]::Create
+$level = [System.IO.Compression.CompressionLevel]::Optimal
+$fs = [System.IO.File]::Create($zipPath)
+$zip = New-Object System.IO.Compression.ZipArchive($fs, $mode)
 try {
   foreach ($rel in $files) {
-    $dest = Join-Path $stage $rel
-    $destDir = Split-Path $dest -Parent
-    if (-not (Test-Path $destDir)) { New-Item -ItemType Directory -Path $destDir -Force | Out-Null }
-    Copy-Item (Join-Path $repo $rel) $dest
+    $entryName = $rel -replace '\\', '/'
+    $entry = $zip.CreateEntry($entryName, $level)
+    $entryStream = $entry.Open()
+    $fileStream = [System.IO.File]::OpenRead((Join-Path $repo $rel))
+    try { $fileStream.CopyTo($entryStream) } finally { $fileStream.Dispose(); $entryStream.Dispose() }
   }
-  if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
-  Compress-Archive -Path "$stage\*" -DestinationPath $zipPath -Force
 } finally {
-  Remove-Item $stage -Recurse -Force
+  $zip.Dispose()
+  $fs.Dispose()
+}
+
+# Post-build validation of the actual archive: separator spec, entry set =
+# allowlist, and the 228 MB model is really inside (not an LFS stub).
+$zip = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+try {
+  if ($zip.Entries.Count -ne $files.Count) {
+    throw "zip entry count $($zip.Entries.Count) != allowlist $($files.Count)"
+  }
+  $badSep = @($zip.Entries | Where-Object { $_.FullName -match '\\' })
+  if ($badSep.Count -gt 0) { throw "backslash-separated zip entries exist (ZIP spec violation)" }
+  $names = @($zip.Entries | ForEach-Object { $_.FullName })
+  foreach ($rel in $files) {
+    $norm = $rel -replace '\\', '/'
+    if ($names -notcontains $norm) { throw "missing from zip: $norm" }
+  }
+  $modelEntry = $zip.Entries | Where-Object { $_.FullName -eq 'models/sensevoice/model.int8.onnx' }
+  if (($modelEntry.Length) -lt 200MB) { throw "model.int8.onnx in zip too small ($($modelEntry.Length) B) - LFS pointer shipped?" }
+} finally {
+  $zip.Dispose()
 }
 
 $zip = Get-Item $zipPath
 Write-Host "$($zip.FullName) - files: $($files.Count) - $([math]::Round($zip.Length/1MB,1)) MB"
+Write-Host "Post-build validation OK: separators, entry set, model size"

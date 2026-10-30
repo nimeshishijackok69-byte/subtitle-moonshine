@@ -573,6 +573,11 @@ async function disposeSessionResources(cur) {
 }
 
 async function stopSession(options={}) {
+  // Bump first, before any await or the null-session early return: this is
+  // what an in-flight startSession() keys on. Increment even when there is
+  // no session — a Stop pressed during the start prelude is exactly the
+  // (session === null) case this epoch exists to signal.
+  sessionEpoch += 1;
   const finalState = options.finalState || STATE.IDLE;
   if(!session) { await setState(finalState); return; }
 
@@ -612,6 +617,14 @@ async function stopSession(options={}) {
 // cleared on every exit.
 let startingCapture = false;
 
+// Stop-during-start abort: `session` stays null for the whole slow prelude
+// (model load, capture picker, worklet module load), so an in-flight start is
+// invisible to stopSession()'s own guard. Every stopSession() bumps this
+// counter first; startSession snaps the epoch after its own prelude-stop and
+// re-checks at each await boundary, bailing out and disposing resources if
+// the user pressed Stop in the meantime.
+let sessionEpoch = 0;
+
 async function startSession(tabId, config) {
   if (startingCapture) return;
   startingCapture = true;
@@ -619,19 +632,28 @@ async function startSession(tabId, config) {
   try {
     if(session) await stopSession();
     intentionalStop=false;
+    // Snap AFTER the stale-session stop above: any stopSession() from here on
+    // (a user Stop during model load or capture) bumps the epoch and aborts
+    // this start at the next check.
+    const myEpoch = sessionEpoch;
+    const epochAbort = new Error("STOP_DURING_START");
+    epochAbort.epochAbort = true;
 
     let displayStream=null, audioContext=null;
     try {
     // Load VAD
     await setState(STATE.LOADING_VAD);
     await loadVad(); resetVadState();
+    if(sessionEpoch!==myEpoch) throw epochAbort;
 
     // Load SenseVoice model
     await setState(STATE.LOADING_MODEL);
     await loadAsr();
+    if(sessionEpoch!==myEpoch) throw epochAbort;
 
     await setState(STATE.AWAITING_CAPTURE_PERMISSION);
     await sendMsg({type:MSG.OFFSCREEN_CLEAR_ALL, tabId});
+    if(sessionEpoch!==myEpoch) throw epochAbort;
 
     displayStream = await navigator.mediaDevices.getDisplayMedia({
       video: { displaySurface: "browser" },
@@ -651,6 +673,9 @@ async function startSession(tabId, config) {
     await setState(STATE.CAPTURING);
     audioContext = new AudioContext();
     await audioContext.audioWorklet.addModule(chrome.runtime.getURL("audio-worklet.js"));
+    if(sessionEpoch!==myEpoch) throw epochAbort;
+    // Only synchronous work between this check and `session = {...}`, so a
+    // stop arriving later is served by the normal stop path (session non-null).
     const captureStream = new MediaStream([audioTrack]);
     const sourceNode = audioContext.createMediaStreamSource(captureStream);
     const workletNode = new AudioWorkletNode(audioContext, "pcm-capture-processor", {
@@ -703,6 +728,12 @@ async function startSession(tabId, config) {
     if(current.audioContext.state==="suspended") await current.audioContext.resume();
   } catch(err) {
     if(!session) await disposeSessionResources({displayStream, audioContext});
+    if(err?.epochAbort) {
+      // The user's Stop bumped the epoch and already ran stopSession() (state
+      // reset to IDLE, no error banner) while this start was still in its
+      // prelude. Resources are disposed above; nothing else to report.
+      return;
+    }
     await stopSession();
     if(err?.name==="NotAllowedError") { await reportError("CAPTURE_DENIED","Permission denied"); return; }
     if(err?.name==="NotFoundError") { await reportError("NO_AUDIO_TRACK","No shared audio"); return; }
