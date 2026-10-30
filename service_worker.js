@@ -62,8 +62,19 @@ async function ensureOffscreenDocument() {
     });
   }
 
-  await creatingOffscreen;
-  creatingOffscreen = null;
+  // Stale-promise guard: if createDocument() rejects, `creatingOffscreen` must
+  // be cleared or every later start re-awaits the rejected promise instead of
+  // retrying, until the service worker itself is terminated. The identity
+  // check keeps concurrent callers sharing one creation promise to null it
+  // exactly once (the winner, so a later set by a renewed caller survives).
+  const creation = creatingOffscreen;
+  try {
+    await creation;
+  } finally {
+    if (creatingOffscreen === creation) {
+      creatingOffscreen = null;
+    }
+  }
 }
 
 async function closeOffscreenDocumentIfPresent() {
