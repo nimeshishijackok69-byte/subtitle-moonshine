@@ -1,4 +1,4 @@
-const { MSG, STATE } = globalThis.HIANIME;
+const { MSG, STATE } = globalThis.LIVE_SUBS;
 
 const TARGET_SAMPLE_RATE = 16000;
 const VAD_FRAME_SAMPLES = 512;

@@ -1,4 +1,4 @@
-const { MSG, STATE } = globalThis.HIANIME;
+const { MSG, STATE } = globalThis.LIVE_SUBS;
 
 const DEFAULTS = {
   "overlay.lines": 3,
@@ -152,6 +152,18 @@ async function startSession() {
   }
 
   const tabId = await getActiveTabId();
+  // Least privilege: instead of requesting <all_urls> at install time (the
+  // "read and change all your data on all websites" warning), the extension
+  // asks for the transcribed origin only, right when the user clicks Start
+  // (an explicit user gesture). With the grant, re-injection survives same-
+  // site navigation; without it, Start still works through the activeTab
+  // grant and the permission can be granted later per-site.
+  const [tab] = await chrome.tabs.get(tabId);
+  if (tab?.url && /^https?:/i.test(tab.url)) {
+    await chrome.permissions
+      .request({ origins: [`${new URL(tab.url).origin}/*`] })
+      .catch(() => null);
+  }
   setStatus(STATE.CREATING_OFFSCREEN);
 
   const response = await chrome.runtime.sendMessage({

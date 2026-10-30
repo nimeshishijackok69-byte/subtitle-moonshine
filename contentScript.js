@@ -1,5 +1,5 @@
 (function () {
-  const { MSG } = globalThis.HIANIME || {
+  const { MSG } = globalThis.LIVE_SUBS || {
     MSG: {
       APPLY_SETTINGS: "APPLY_SETTINGS",
       DG_TRANSCRIPT: "DG_TRANSCRIPT",
@@ -453,16 +453,24 @@
   // Main-world bridge: Expose __dgTelemetry to DevTools top console without switching context
   function injectMainWorldBridge() {
     try {
+      // Per-injection shared secret: the page's own scripts get wrapped events
+      // designed to stay page-side, but CustomEvents are dispatchable by any
+      // page script too. Without the token a hostile page could spam CSV
+      // downloads (/ spoof the cached stats readout. Getting the token back
+      // out requires having read the script element before it is removed at
+      // the bottom of this try block — page scripts only execute after this
+      // synchronous block completes, and the <script> tag is already gone.
+      const token = (crypto.randomUUID ? crypto.randomUUID() : String(crypto.getRandomValues(new Uint32Array(4))));
       const script = document.createElement("script");
-      script.id = "dg-telemetry-bridge";
       script.textContent = `
         window.__dgTelemetry = {
+          _t: ${JSON.stringify(token)},
           getStats: () => {
-            window.dispatchEvent(new CustomEvent("__dg_req_stats"));
+            window.dispatchEvent(new CustomEvent("__dg_req_stats", { detail: window.__dgTelemetry._t }));
             return window.__dgTelemetryCached || "Calculating stats (logged below)...";
           },
           downloadCsv: (fn) => {
-            window.dispatchEvent(new CustomEvent("__dg_req_csv", { detail: fn }));
+            window.dispatchEvent(new CustomEvent("__dg_req_csv", { detail: { t: window.__dgTelemetry._t, fn } }));
           }
         };
         window.addEventListener("__dg_res_stats", (e) => {
@@ -475,12 +483,14 @@
       (document.head || document.documentElement).appendChild(script);
       script.remove();
 
-      window.addEventListener("__dg_req_stats", () => {
+      window.addEventListener("__dg_req_stats", (e) => {
+        if (e.detail !== token) return;
         const stats = telemetry.getStats();
         window.dispatchEvent(new CustomEvent("__dg_res_stats", { detail: stats }));
       });
       window.addEventListener("__dg_req_csv", (e) => {
-        telemetry.downloadCsv(e.detail);
+        if (!e || !e.detail || e.detail.t !== token) return;
+        telemetry.downloadCsv(e.detail.fn);
       });
     } catch (e) {
       // A page CSP without 'unsafe-inline' blocks the injected script, and the
