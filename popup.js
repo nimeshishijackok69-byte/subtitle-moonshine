@@ -1,4 +1,4 @@
-const { MSG, STATE } = globalThis.HIANIME;
+const { MSG, STATE } = globalThis.LIVE_SUBS;
 
 const DEFAULTS = {
   "overlay.lines": 3,
@@ -154,6 +154,15 @@ async function startSession() {
   const tabId = await getActiveTabId();
   setStatus(STATE.CREATING_OFFSCREEN);
 
+  // NOTE: no chrome.permissions.request here on purpose. Chrome MV3's user
+  // gesture ends at this handler's first await, so permissions.request called
+  // after the storage/tab lookups above always rejects with "This function
+  // must be called during a user gesture" — it would be dead code with a
+  // silently swallowed rejection. Injection therefore relies on the
+  // activeTab grant from this popup click. If subtitles should survive
+  // cross-origin navigation, grant the site manually (address-bar padlock
+  // icon > Site settings, or chrome://settings/content/all): the manifest
+  // declares optional_host_permissions for exactly that.
   const response = await chrome.runtime.sendMessage({
     type: MSG.START_SESSION,
     tabId,
@@ -203,6 +212,10 @@ for (const input of [els.lines, els.fontSize, els.opacity, els.showInterim]) {
 }
 
 els.start.addEventListener("click", () => {
+  // Disable synchronously in the gesture turn: the rest of the click flow
+  // awaits storage/tab IPC calls before the first status update, leaving a
+  // double-click window that would race two concurrent sessions.
+  els.start.disabled = true;
   startSession().catch((error) => setStatus(STATE.ERROR, error.message));
 });
 

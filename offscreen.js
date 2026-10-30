@@ -1,4 +1,4 @@
-const { MSG, STATE } = globalThis.HIANIME;
+const { MSG, STATE } = globalThis.LIVE_SUBS;
 
 const TARGET_SAMPLE_RATE = 16000;
 const VAD_FRAME_SAMPLES = 512;
@@ -238,8 +238,14 @@ function withAsrLock(current, task) {
 // the overlay can only show text once that audio has been captured, so the
 // audible delay is measured against it, not against the decode start.
 function telemetryFor(current, audioSamples, captureEpoch, asrDurationMs) {
+  // Dropped chunks punch holes out of the ring: N accepted samples no longer
+  // map to streamStartEpoch + N/rate as wall time. Charging the dropped-audio
+  // duration into audioSeconds restores the mapping, so every downstream
+  // latency metric (audioLagMs, soundToSubtitleMs) stays truthful. Slight
+  // overstatement is possible for drops inside the decode window itself.
+  const droppedSeconds = (current.droppedAudioSamples || 0) / TARGET_SAMPLE_RATE;
   return {
-    audioSeconds: Math.round((audioSamples / TARGET_SAMPLE_RATE) * 100) / 100,
+    audioSeconds: Math.round(((audioSamples / TARGET_SAMPLE_RATE) + droppedSeconds) * 100) / 100,
     capturedAt: captureEpoch,
     streamStartEpoch: current.streamStartEpoch || null,
     asrDurationMs,
@@ -453,14 +459,48 @@ function handleVadFrame(current, probability, frameStart, frameEnd) {
   }
 }
 
+// Realtime audio must not queue up faster than it is consumed. When VAD is
+// slower than realtime, a serialized chain grows without bound — memory bloat
+// plus steadily climbing audible lag. Past this many QUEUED chunks (~0.5 s of
+// audio at the default 25 ms chunks) the OLDEST queued chunk is dropped:
+// stale audio can never reduce lag by being decoded later, and keeping the
+// fresh tail preserves the most recent speech for the next decode.
+const PCM_MAX_QUEUE_CHUNKS = 20;
+
 function enqueuePcm(current, arrayBuffer) {
-  current.pcmQueue = current.pcmQueue
-    .then(() => processPcmChunk(current, arrayBuffer))
-    .catch((error) => {
+  if (current.pcmQueue.length >= PCM_MAX_QUEUE_CHUNKS) {
+    current.pcmQueue.shift();
+    current.droppedAudioSamples += current.chunkSamples;
+    current.pcmDropped += 1;
+    if (current.pcmDropped === 1 || current.pcmDropped % 50 === 0) {
+      console.warn(
+        `[Backpressure] PCM queue full; dropped oldest chunk #${current.pcmDropped}. ` +
+        "VAD is not keeping up with realtime capture."
+      );
+    }
+  }
+  current.pcmQueue.push(arrayBuffer);
+  if (!current.pcmRunning) {
+    current.pcmRunning = true;
+    void pcmDrain(current);
+  }
+}
+
+// Single consumer: chunks leave the queue strictly one at a time, exactly like
+// the promise chain this replaces. Drops only ever evict queued entries, never
+// the chunk currently executing.
+async function pcmDrain(current) {
+  while (current.pcmQueue.length > 0) {
+    const arrayBuffer = current.pcmQueue.shift();
+    try {
+      await processPcmChunk(current, arrayBuffer);
+    } catch (error) {
       if (session === current && !intentionalStop) {
         reportError("AUDIO_PROCESS_ERROR", error.message);
       }
-    });
+    }
+  }
+  current.pcmRunning = false;
 }
 
 async function processPcmChunk(current, arrayBuffer) {
@@ -509,7 +549,8 @@ function getStatus() {
     ok: true,
     state: offscreenState,
     hasSession: Boolean(session),
-    tabId: session?.tabId || null
+    tabId: session?.tabId || null,
+    droppedChunks: session?.pcmDropped || 0
   };
 }
 
@@ -532,6 +573,11 @@ async function disposeSessionResources(cur) {
 }
 
 async function stopSession(options={}) {
+  // Bump first, before any await or the null-session early return: this is
+  // what an in-flight startSession() keys on. Increment even when there is
+  // no session — a Stop pressed during the start prelude is exactly the
+  // (session === null) case this epoch exists to signal.
+  sessionEpoch += 1;
   const finalState = options.finalState || STATE.IDLE;
   if(!session) { await setState(finalState); return; }
 
@@ -565,22 +611,49 @@ async function stopSession(options={}) {
   await setState(finalState);
 }
 
-async function startSession(tabId, config) {
-  if(session) await stopSession();
-  intentionalStop=false;
+// Capture-start latch: loadVad/loadAsr take seconds, during which `session`
+// is still null — a second START would run a second capture picker and the
+// loser's stream would never be disposed. Set before the first await,
+// cleared on every exit.
+let startingCapture = false;
 
-  let displayStream=null, audioContext=null;
+// Stop-during-start abort: `session` stays null for the whole slow prelude
+// (model load, capture picker, worklet module load), so an in-flight start is
+// invisible to stopSession()'s own guard. Every stopSession() bumps this
+// counter first; startSession snaps the epoch after its own prelude-stop and
+// re-checks at each await boundary, bailing out and disposing resources if
+// the user pressed Stop in the meantime.
+let sessionEpoch = 0;
+
+async function startSession(tabId, config) {
+  if (startingCapture) return;
+  startingCapture = true;
+
   try {
+    if(session) await stopSession();
+    intentionalStop=false;
+    // Snap AFTER the stale-session stop above: any stopSession() from here on
+    // (a user Stop during model load or capture) bumps the epoch and aborts
+    // this start at the next check.
+    const myEpoch = sessionEpoch;
+    const epochAbort = new Error("STOP_DURING_START");
+    epochAbort.epochAbort = true;
+
+    let displayStream=null, audioContext=null;
+    try {
     // Load VAD
     await setState(STATE.LOADING_VAD);
     await loadVad(); resetVadState();
+    if(sessionEpoch!==myEpoch) throw epochAbort;
 
     // Load SenseVoice model
     await setState(STATE.LOADING_MODEL);
     await loadAsr();
+    if(sessionEpoch!==myEpoch) throw epochAbort;
 
     await setState(STATE.AWAITING_CAPTURE_PERMISSION);
     await sendMsg({type:MSG.OFFSCREEN_CLEAR_ALL, tabId});
+    if(sessionEpoch!==myEpoch) throw epochAbort;
 
     displayStream = await navigator.mediaDevices.getDisplayMedia({
       video: { displaySurface: "browser" },
@@ -592,7 +665,7 @@ async function startSession(tabId, config) {
     const [videoTrack] = displayStream.getVideoTracks();
     if(/live subtitle audio worker|chrome-extension/i.test(`${videoTrack?.label} ${audioTrack?.label}`)) {
       displayStream.getTracks().forEach(t=>t.stop());
-      await reportError("WRONG_CAPTURE_SOURCE","Choose the anime tab"); await setState(STATE.IDLE); return;
+      await reportError("WRONG_CAPTURE_SOURCE","Choose the tab you want subtitled"); await setState(STATE.IDLE); return;
     }
     if(!audioTrack) { displayStream.getTracks().forEach(t=>t.stop());
       await reportError("NO_AUDIO_TRACK","No shared audio"); await setState(STATE.IDLE); return; }
@@ -600,6 +673,9 @@ async function startSession(tabId, config) {
     await setState(STATE.CAPTURING);
     audioContext = new AudioContext();
     await audioContext.audioWorklet.addModule(chrome.runtime.getURL("audio-worklet.js"));
+    if(sessionEpoch!==myEpoch) throw epochAbort;
+    // Only synchronous work between this check and `session = {...}`, so a
+    // stop arriving later is served by the normal stop path (session non-null).
     const captureStream = new MediaStream([audioTrack]);
     const sourceNode = audioContext.createMediaStreamSource(captureStream);
     const workletNode = new AudioWorkletNode(audioContext, "pcm-capture-processor", {
@@ -618,12 +694,22 @@ async function startSession(tabId, config) {
       segmenter: createSegmenter(),
       vadPending: new Int16Array(0),
       vadAbs: 0,
+      // Chunk pipeline: array-backed queue drained strictly serially by
+      // pcmDrain(). chunkSamples mirrors the worklet's per-chunk size at
+      // TARGET_SAMPLE_RATE, so a dropped chunk can charge its wall-clock
+      // duration into droppedAudioSamples for the telemetry mapping.
+      pcmQueue: [],
+      pcmRunning: false,
+      pcmDropped: 0,
+      droppedAudioSamples: 0,
+      chunkSamples: Math.max(160, Math.round(TARGET_SAMPLE_RATE * (config.chunkMs || 25) / 1000)),
       // Epoch of the first captured PCM chunk. Audio position 0 of the ring
-      // buffer maps to this wall-clock instant, so (capturedAt - streamStartEpoch)
-      // minus the decoded audio position yields how far behind real time the
-      // pipeline is running.
+      // buffer maps to this wall-clock instant. Chunk drops punch straight-
+      // time holes into the ring, so telemetryFor charges dropped-audio time
+      // into audioSeconds — keeping (streamStartEpoch + audioSeconds*1000)
+      // equal to the wall clock of the sound being decoded, and every
+      // downstream latency metric truthful even under overload.
       streamStartEpoch: 0,
-      pcmQueue: Promise.resolve(),
       asrChain: Promise.resolve(),
       utterance: null,
       flushTask: null,
@@ -642,10 +728,19 @@ async function startSession(tabId, config) {
     if(current.audioContext.state==="suspended") await current.audioContext.resume();
   } catch(err) {
     if(!session) await disposeSessionResources({displayStream, audioContext});
+    if(err?.epochAbort) {
+      // The user's Stop bumped the epoch and already ran stopSession() (state
+      // reset to IDLE, no error banner) while this start was still in its
+      // prelude. Resources are disposed above; nothing else to report.
+      return;
+    }
     await stopSession();
     if(err?.name==="NotAllowedError") { await reportError("CAPTURE_DENIED","Permission denied"); return; }
     if(err?.name==="NotFoundError") { await reportError("NO_AUDIO_TRACK","No shared audio"); return; }
     await reportError("START_FAILED", err?.message || "Unable to start");
+  }
+  } finally {
+    startingCapture = false;
   }
 }
 

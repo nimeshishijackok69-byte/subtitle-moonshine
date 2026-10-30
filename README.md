@@ -1,4 +1,4 @@
-# HiAnime Live Japanese Subtitles
+# Live Japanese Subtitles — On-Device AI
 
 A Chrome/Edge MV3 extension that captures audio from a tab, transcribes Japanese speech locally, and draws selectable subtitles over the page.
 
@@ -51,7 +51,8 @@ popup → service worker → offscreen document → AudioWorklet → 16 kHz PCM
 - **Silero VAD** runs on 512-sample frames fed with the preceding 64 samples of context (the v5 wrapper relies on it). Onset needs 3 frames above `0.50`; an utterance closes after 640 ms below `0.35`. Windows are anchored at 300 ms pre-roll, padded 200 ms, floored at 1.0 s and capped at 8 s.
 - **SenseVoice** runs a JS fbank frontend (80 bins, LFR 7/6, CMVN) and greedy CTC decode with `language=ja`, `text_norm` on. Output is NFKC-normalised, tags stripped, and Japanese inter-character spaces removed.
 - **Committer** re-decodes the anchored window every 750 ms while speech continues, commits only the longest common prefix minus a 4-character holdback, and rewrites one line per utterance (`GROW` / `REVISE` / `INTERIM` / `FINAL`). Every decode is serialised through one promise chain so a late tick can't overwrite a finished line.
-- **Service worker** relays messages, re-injects the overlay after a tab reload, and closes the offscreen document 5 minutes after the session goes idle.
+- **Backpressure** caps the PCM queue at 20 chunks (~0.5 s). If VAD falls behind realtime the oldest queued chunk is dropped, because stale audio cannot reduce lag by being decoded later; the dropped duration is charged into the latency telemetry so `audioLagMs` stays truthful.
+- **Service worker** relays messages, re-injects the overlay when a tab finishes navigating, and schedules offscreen teardown 5 minutes after the session goes idle. That timer is a `setTimeout`, which does not survive service-worker termination (~30 s idle), so the document can outlive the intended window — a known gap, not a guarantee.
 
 ## Files
 
@@ -67,6 +68,7 @@ popup → service worker → offscreen document → AudioWorklet → 16 kHz PCM
 | `contentScript.js` | Overlay, drag/close, telemetry |
 | `models/sensevoice/` | int8 model, tokens, frontend config (LFS) |
 | `lib/` | ONNX Runtime Web 1.21, Silero VAD (LFS) |
+| `package.ps1` | Builds the store zip from a strict allowlist and validates it |
 
 ## Errors
 
@@ -74,14 +76,16 @@ popup → service worker → offscreen document → AudioWorklet → 16 kHz PCM
 
 ## Telemetry
 
-The content script keeps the last 1000 committer events. From the page console:
+The content script keeps the last 1000 committer events in memory, in the extension's isolated world only. There is no page-world bridge on purpose: an inline script exposing `getStats()` / `downloadCsv()` would be readable by every page script and would hand pages a page-triggered download capability, so none is created.
+
+To inspect it, open DevTools on the page, switch the JavaScript context to the extension (Chrome 130+: the "JavaScript context: Extension" entry), then:
 
 ```js
 __dgTelemetry.getStats()     // percentiles for FINAL lines
 __dgTelemetry.downloadCsv()  // raw events as CSV
 ```
 
-It reports ASR time, end-to-end latency, audio backlog, and sound-to-subtitle delay.
+It reports ASR time, end-to-end latency, audio backlog, and sound-to-subtitle delay. Percentiles cover `FINAL` rows only; interim decodes are in the CSV but not in the summary.
 
 ## Known limitations
 
@@ -89,7 +93,7 @@ It reports ASR time, end-to-end latency, audio backlog, and sound-to-subtitle de
 - The 8 s cap can cut a long continuous sentence.
 - A misrecognition that survives prefix agreement stays on screen until the utterance ends.
 - Short interjections (`あ。`, `はい。`) are the main hallucination residue.
-- `models/onnx/` and `models/tokenizer*` are legacy Moonshine artifacts; the runtime doesn't load them.
+- Overlay re-injection after navigation needs host access to the new origin. The `activeTab` grant covers the tab you pressed Start on; navigating to a different site drops the overlay until you press Start again or pre-grant that site.
 
 ## Model licence
 

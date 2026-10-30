@@ -1,15 +1,17 @@
 {
   "manifest_version": 3,
-  "name": "Hianime Live Japanese Subtitles",
-  "description": "Live Japanese subtitles using a local speech model and Silero VAD.",
-  "version": "0.3.0",
+  "name": "Live Japanese Subtitles — On-Device AI",
+  "description": "Live Japanese subtitles for any video tab, transcribed entirely on your device. No audio ever leaves the browser.",
+  "version": "0.3.1",
   "minimum_chrome_version": "116",
   "permissions": [
     "activeTab",
     "offscreen",
     "scripting",
-    "storage",
-    "tabs"
+    "storage"
+  ],
+  "optional_host_permissions": [
+    "<all_urls>"
   ],
   "background": {
     "service_worker": "service_worker.js",
