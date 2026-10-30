@@ -238,8 +238,14 @@ function withAsrLock(current, task) {
 // the overlay can only show text once that audio has been captured, so the
 // audible delay is measured against it, not against the decode start.
 function telemetryFor(current, audioSamples, captureEpoch, asrDurationMs) {
+  // Dropped chunks punch holes out of the ring: N accepted samples no longer
+  // map to streamStartEpoch + N/rate as wall time. Charging the dropped-audio
+  // duration into audioSeconds restores the mapping, so every downstream
+  // latency metric (audioLagMs, soundToSubtitleMs) stays truthful. Slight
+  // overstatement is possible for drops inside the decode window itself.
+  const droppedSeconds = (current.droppedAudioSamples || 0) / TARGET_SAMPLE_RATE;
   return {
-    audioSeconds: Math.round((audioSamples / TARGET_SAMPLE_RATE) * 100) / 100,
+    audioSeconds: Math.round(((audioSamples / TARGET_SAMPLE_RATE) + droppedSeconds) * 100) / 100,
     capturedAt: captureEpoch,
     streamStartEpoch: current.streamStartEpoch || null,
     asrDurationMs,
@@ -454,34 +460,47 @@ function handleVadFrame(current, probability, frameStart, frameEnd) {
 }
 
 // Realtime audio must not queue up faster than it is consumed. When VAD is
-// slower than realtime, the serialized chain grows without bound — memory
-// bloat plus steadily climbing audible lag. Past this depth (0.5 s of audio
-// at the default 25 ms chunks) incoming chunks are dropped instead of queued:
-// they can never reduce lag by being decoded later.
+// slower than realtime, a serialized chain grows without bound — memory bloat
+// plus steadily climbing audible lag. Past this many QUEUED chunks (~0.5 s of
+// audio at the default 25 ms chunks) the OLDEST queued chunk is dropped:
+// stale audio can never reduce lag by being decoded later, and keeping the
+// fresh tail preserves the most recent speech for the next decode.
 const PCM_MAX_QUEUE_CHUNKS = 20;
 
 function enqueuePcm(current, arrayBuffer) {
-  if ((current.pcmPending || 0) >= PCM_MAX_QUEUE_CHUNKS) {
-    current.pcmDropped = (current.pcmDropped || 0) + 1;
+  if (current.pcmQueue.length >= PCM_MAX_QUEUE_CHUNKS) {
+    current.pcmQueue.shift();
+    current.droppedAudioSamples += current.chunkSamples;
+    current.pcmDropped += 1;
     if (current.pcmDropped === 1 || current.pcmDropped % 50 === 0) {
       console.warn(
-        `[Backpressure] PCM queue full; dropped chunk #${current.pcmDropped}. ` +
+        `[Backpressure] PCM queue full; dropped oldest chunk #${current.pcmDropped}. ` +
         "VAD is not keeping up with realtime capture."
       );
     }
-    return;
   }
-  current.pcmPending = (current.pcmPending || 0) + 1;
-  current.pcmQueue = current.pcmQueue
-    .then(() => processPcmChunk(current, arrayBuffer))
-    .catch((error) => {
+  current.pcmQueue.push(arrayBuffer);
+  if (!current.pcmRunning) {
+    current.pcmRunning = true;
+    void pcmDrain(current);
+  }
+}
+
+// Single consumer: chunks leave the queue strictly one at a time, exactly like
+// the promise chain this replaces. Drops only ever evict queued entries, never
+// the chunk currently executing.
+async function pcmDrain(current) {
+  while (current.pcmQueue.length > 0) {
+    const arrayBuffer = current.pcmQueue.shift();
+    try {
+      await processPcmChunk(current, arrayBuffer);
+    } catch (error) {
       if (session === current && !intentionalStop) {
         reportError("AUDIO_PROCESS_ERROR", error.message);
       }
-    })
-    .finally(() => {
-      current.pcmPending = Math.max(0, (current.pcmPending || 0) - 1);
-    });
+    }
+  }
+  current.pcmRunning = false;
 }
 
 async function processPcmChunk(current, arrayBuffer) {
@@ -530,7 +549,8 @@ function getStatus() {
     ok: true,
     state: offscreenState,
     hasSession: Boolean(session),
-    tabId: session?.tabId || null
+    tabId: session?.tabId || null,
+    droppedChunks: session?.pcmDropped || 0
   };
 }
 
@@ -639,14 +659,22 @@ async function startSession(tabId, config) {
       segmenter: createSegmenter(),
       vadPending: new Int16Array(0),
       vadAbs: 0,
-      pcmPending: 0,
+      // Chunk pipeline: array-backed queue drained strictly serially by
+      // pcmDrain(). chunkSamples mirrors the worklet's per-chunk size at
+      // TARGET_SAMPLE_RATE, so a dropped chunk can charge its wall-clock
+      // duration into droppedAudioSamples for the telemetry mapping.
+      pcmQueue: [],
+      pcmRunning: false,
       pcmDropped: 0,
+      droppedAudioSamples: 0,
+      chunkSamples: Math.max(160, Math.round(TARGET_SAMPLE_RATE * (config.chunkMs || 25) / 1000)),
       // Epoch of the first captured PCM chunk. Audio position 0 of the ring
-      // buffer maps to this wall-clock instant, so (capturedAt - streamStartEpoch)
-      // minus the decoded audio position yields how far behind real time the
-      // pipeline is running.
+      // buffer maps to this wall-clock instant. Chunk drops punch straight-
+      // time holes into the ring, so telemetryFor charges dropped-audio time
+      // into audioSeconds — keeping (streamStartEpoch + audioSeconds*1000)
+      // equal to the wall clock of the sound being decoded, and every
+      // downstream latency metric truthful even under overload.
       streamStartEpoch: 0,
-      pcmQueue: Promise.resolve(),
       asrChain: Promise.resolve(),
       utterance: null,
       flushTask: null,

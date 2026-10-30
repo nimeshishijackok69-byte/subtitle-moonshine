@@ -207,12 +207,21 @@ async function startSession({ tabId, config }) {
       config
     });
   } catch (error) {
-    // Without this reset the state stays CREATING_OFFSCREEN after a failed
+    // Without a reset the state stays CREATING_OFFSCREEN after a failed
     // injection or offscreen creation, and every later Start is refused as
     // "already running" — with no offscreen document to even stop. The popup
-    // still receives the error through the run().catch response path.
-    currentState = STATE.IDLE;
-    activeTabId = null;
+    // still receives the error through the run().catch response path. The
+    // guard keeps an OFFSCREEN_STATE/ERROR update that already landed from
+    // being clobbered back to IDLE.
+    if (currentState === STATE.CREATING_OFFSCREEN) {
+      currentState = STATE.IDLE;
+      activeTabId = null;
+      // A failed start can leave a warm offscreen document behind with no
+      // session; hand it back to the deferred-teardown path.
+      if (await hasOffscreenDocument().catch(() => false)) {
+        scheduleOffscreenTeardown();
+      }
+    }
     throw error;
   }
 
