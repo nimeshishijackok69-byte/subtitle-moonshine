@@ -453,13 +453,34 @@ function handleVadFrame(current, probability, frameStart, frameEnd) {
   }
 }
 
+// Realtime audio must not queue up faster than it is consumed. When VAD is
+// slower than realtime, the serialized chain grows without bound — memory
+// bloat plus steadily climbing audible lag. Past this depth (0.5 s of audio
+// at the default 25 ms chunks) incoming chunks are dropped instead of queued:
+// they can never reduce lag by being decoded later.
+const PCM_MAX_QUEUE_CHUNKS = 20;
+
 function enqueuePcm(current, arrayBuffer) {
+  if ((current.pcmPending || 0) >= PCM_MAX_QUEUE_CHUNKS) {
+    current.pcmDropped = (current.pcmDropped || 0) + 1;
+    if (current.pcmDropped === 1 || current.pcmDropped % 50 === 0) {
+      console.warn(
+        `[Backpressure] PCM queue full; dropped chunk #${current.pcmDropped}. ` +
+        "VAD is not keeping up with realtime capture."
+      );
+    }
+    return;
+  }
+  current.pcmPending = (current.pcmPending || 0) + 1;
   current.pcmQueue = current.pcmQueue
     .then(() => processPcmChunk(current, arrayBuffer))
     .catch((error) => {
       if (session === current && !intentionalStop) {
         reportError("AUDIO_PROCESS_ERROR", error.message);
       }
+    })
+    .finally(() => {
+      current.pcmPending = Math.max(0, (current.pcmPending || 0) - 1);
     });
 }
 
@@ -618,6 +639,8 @@ async function startSession(tabId, config) {
       segmenter: createSegmenter(),
       vadPending: new Int16Array(0),
       vadAbs: 0,
+      pcmPending: 0,
+      pcmDropped: 0,
       // Epoch of the first captured PCM chunk. Audio position 0 of the ring
       // buffer maps to this wall-clock instant, so (capturedAt - streamStartEpoch)
       // minus the decoded audio position yields how far behind real time the

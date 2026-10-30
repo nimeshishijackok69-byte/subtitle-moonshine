@@ -191,20 +191,30 @@ async function startSession({ tabId, config }) {
   lastOverlayConfig = overlayConfig;
   currentState = STATE.CREATING_OFFSCREEN;
 
-  await ensureOverlayAndSend(tabId, {
-    type: MSG.CLEAR_ALL
-  });
-  await ensureOverlayAndSend(tabId, {
-    type: MSG.APPLY_SETTINGS,
-    config: overlayConfig
-  });
-  await ensureOffscreenDocument();
-  await chrome.runtime.sendMessage({
-    type: MSG.START,
-    target: "offscreen",
-    tabId,
-    config
-  });
+  try {
+    await ensureOverlayAndSend(tabId, {
+      type: MSG.CLEAR_ALL
+    });
+    await ensureOverlayAndSend(tabId, {
+      type: MSG.APPLY_SETTINGS,
+      config: overlayConfig
+    });
+    await ensureOffscreenDocument();
+    await chrome.runtime.sendMessage({
+      type: MSG.START,
+      target: "offscreen",
+      tabId,
+      config
+    });
+  } catch (error) {
+    // Without this reset the state stays CREATING_OFFSCREEN after a failed
+    // injection or offscreen creation, and every later Start is refused as
+    // "already running" — with no offscreen document to even stop. The popup
+    // still receives the error through the run().catch response path.
+    currentState = STATE.IDLE;
+    activeTabId = null;
+    throw error;
+  }
 
   return { ok: true };
 }
