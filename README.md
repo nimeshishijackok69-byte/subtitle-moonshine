@@ -1,6 +1,6 @@
-# HiAnime - Live Japanese Subtitles
+# Live Japanese Subtitles — On-Device AI
 
-A Chrome Manifest V3 extension that captures audio from a user-selected tab, runs local Japanese speech recognition, and renders selectable subtitles over the page.
+A Chrome Manifest V3 extension that captures audio from a tab the user chooses, runs Japanese speech recognition entirely on-device, and renders selectable subtitles over the page.
 
 There is no API key, no server, and no cloud speech service. Audio stays on the machine. The only external dependency used at runtime is the bundled SenseVoice ONNX model plus Silero VAD and ONNX Runtime WebAssembly.
 
@@ -80,7 +80,7 @@ The worklet does not perform VAD. All gating and segmentation happens in `offscr
 
 ### 3. VAD Segmentation
 
-`offscreen.js` keeps a 20-second PCM ring buffer. Silero VAD runs on 512-sample frames (32 ms at 16 kHz), each frame fed to the model **prepended with the 64 samples of audio that preceded it** (576 samples total). Silero v5's reference wrapper carries that left context; without it the encoder collapses to a near-constant "no speech" prior without raising an error. On a 60-second dialogue-dense window of anime audio (685–745 s of the source), the same model returns a median speech probability of `0.0005` on 512-sample input and `0.8988` on 576-sample input. On a cold open the 576-sample path stays closed (max `0.0848`), so the fix does not create false onsets.
+`offscreen.js` keeps a 20-second PCM ring buffer. Silero VAD runs on 512-sample frames (32 ms at 16 kHz), each frame fed to the model **prepended with the 64 samples of audio that preceded it** (576 samples total). Silero v5's reference wrapper carries that left context; without it the encoder collapses to a near-constant "no speech" prior without raising an error. On a 60-second dialogue-dense test window (685–745 s of the source), the same model returns a median speech probability of `0.0005` on 512-sample input and `0.8988` on 576-sample input. On a cold open the 576-sample path stays closed (max `0.0848`), so the fix does not create false onsets.
 
 Current segmentation settings:
 
@@ -139,7 +139,7 @@ Two rules keep the committed text stable:
 1. **Local agreement.** A prefix only commits up to the longest common prefix of the previous and current decode, so a decode that flips a character cannot publish it.
 2. **Holdback.** The last 4 characters of that common prefix stay uncommitted, because the final characters of a decode are the least settled.
 
-Measured on 305 subtitle lines of *Mushoku Tensei* S3E14 with a 0.5 s decode step (finer than the shipped 750 ms), this reduces contradicted text from 36.6% of committed updates to 1.7%, and produces one line per sentence instead of 5.2. The sliding-window comparison was not re-run at 750 ms.
+Measured on 305 subtitle lines of a dialogue-dense test clip with a 0.5 s decode step (finer than the shipped 750 ms), this reduces contradicted text from 36.6% of committed updates to 1.7%, and produces one line per sentence instead of 5.2. The sliding-window comparison was not re-run at 750 ms.
 
 Every ASR call on a session is serialised through one promise chain. A progressive tick and the utterance-final flush would otherwise overlap on the same ONNX session, and the losing decode would deliver a `GROW`/`INTERIM` *after* `FINAL`, rewriting an already-finalised line.
 

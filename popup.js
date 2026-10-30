@@ -144,6 +144,23 @@ async function applyOverlaySettingsToTab() {
   }
 }
 
+async function requestOriginGrant(tabId) {
+  // Least privilege: instead of <all_urls> at install time, ask for the
+  // transcribed origin only. The optional-permission doorhanger can CLOSE
+  // this popup (long-standing Chromium behavior), destroying this context
+  // mid-flow, so startSession dispatches the session first and this runs
+  // afterwards in the same gesture turn without further awaits before it.
+  try {
+    const [tab] = await chrome.tabs.get(tabId);
+    if (!tab?.url || !/^https?:/i.test(tab.url)) return;
+    await chrome.permissions.request({ origins: [`${new URL(tab.url).origin}/*`] });
+  } catch {
+    // Declined, gesture lost, or a non-http(s) tab (chrome://, file://): the
+    // activeTab grant from the popup click still covers this tab's initial
+    // injection; the origin grant only future-proofs re-injection.
+  }
+}
+
 async function startSession() {
   const config = getSessionConfig();
   const saved = await persistAllSettings();
@@ -152,29 +169,24 @@ async function startSession() {
   }
 
   const tabId = await getActiveTabId();
-  // Least privilege: instead of requesting <all_urls> at install time (the
-  // "read and change all your data on all websites" warning), the extension
-  // asks for the transcribed origin only, right when the user clicks Start
-  // (an explicit user gesture). With the grant, re-injection survives same-
-  // site navigation; without it, Start still works through the activeTab
-  // grant and the permission can be granted later per-site.
-  const [tab] = await chrome.tabs.get(tabId);
-  if (tab?.url && /^https?:/i.test(tab.url)) {
-    await chrome.permissions
-      .request({ origins: [`${new URL(tab.url).origin}/*`] })
-      .catch(() => null);
-  }
   setStatus(STATE.CREATING_OFFSCREEN);
 
-  const response = await chrome.runtime.sendMessage({
+  // Dispatch FIRST: never serialize the session behind the permission prompt,
+  // because the doorhanger can close this popup and destroy its JS context
+  // before the await resumes (see requestOriginGrant). The grant is then
+  // requested while the start is already in flight.
+  const starting = chrome.runtime.sendMessage({
     type: MSG.START_SESSION,
     tabId,
     config
+  }).then((response) => {
+    if (!response?.ok) {
+      throw new Error(response?.error || "Unable to start session.");
+    }
   });
 
-  if (!response?.ok) {
-    throw new Error(response?.error || "Unable to start session.");
-  }
+  await requestOriginGrant(tabId);
+  await starting;
 }
 
 async function stopSession() {
@@ -215,6 +227,10 @@ for (const input of [els.lines, els.fontSize, els.opacity, els.showInterim]) {
 }
 
 els.start.addEventListener("click", () => {
+  // Disable synchronously in the gesture turn: the rest of the click flow
+  // awaits storage/tab IPC calls before the first status update, leaving a
+  // double-click window that would race two concurrent sessions.
+  els.start.disabled = true;
   startSession().catch((error) => setStatus(STATE.ERROR, error.message));
 });
 

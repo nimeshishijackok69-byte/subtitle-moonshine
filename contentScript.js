@@ -19,10 +19,19 @@
     FINAL: MSG.TRANSCRIPT_FINAL || "FINAL"
   };
 
-  if (window.__dgLiveSubtitleBootstrapped) {
+  // Both keys live on globalThis inside the extension's isolated world. Note:
+  // string-keyed window flags (window.__foo) are reachable from the page's
+  // DOM — an element like <div id="__dgLiveSubtitleBootstrapped"> makes
+  // window named access truthy and could disable the overlay for the whole
+  // tab. Symbol.for() keys are unreachable from page markup and preserve
+  // state across re-injection.
+  const BOOT_KEY = Symbol.for("dg-live-subtitle/bootstrapped");
+  const STATE_KEY = Symbol.for("dg-live-subtitle/state");
+
+  if (globalThis[BOOT_KEY]) {
     return;
   }
-  window.__dgLiveSubtitleBootstrapped = true;
+  globalThis[BOOT_KEY] = true;
 
   const ROOT_ID = "dg-live-subtitle-overlay";
   const STYLE_ID = "dg-live-subtitle-style";
@@ -34,7 +43,7 @@
     showInterim: true
   };
 
-  const state = window.__dgLiveSubtitleState || {
+  const state = globalThis[STATE_KEY] || {
     finalLines: [],
     settings: { ...defaults },
     root: null,
@@ -48,7 +57,7 @@
     finalizedLineId: null,
     dismissed: false
   };
-  window.__dgLiveSubtitleState = state;
+  globalThis[STATE_KEY] = state;
 
   function ensureStyle() {
     if (document.getElementById(STYLE_ID)) {
@@ -383,9 +392,6 @@
     reset() {
       this.records = [];
       this.nextId = 1;
-      // Clear the page-world cache too, or the console keeps showing the
-      // previous session's percentiles after a reset.
-      window.dispatchEvent(new CustomEvent("__dg_res_stats", { detail: null }));
     },
     getLogs() {
       return this.records;
@@ -449,56 +455,11 @@
     }
   };
   window.__dgTelemetry = telemetry;
-
-  // Main-world bridge: Expose __dgTelemetry to DevTools top console without switching context
-  function injectMainWorldBridge() {
-    try {
-      // Per-injection shared secret: the page's own scripts get wrapped events
-      // designed to stay page-side, but CustomEvents are dispatchable by any
-      // page script too. Without the token a hostile page could spam CSV
-      // downloads (/ spoof the cached stats readout. Getting the token back
-      // out requires having read the script element before it is removed at
-      // the bottom of this try block — page scripts only execute after this
-      // synchronous block completes, and the <script> tag is already gone.
-      const token = (crypto.randomUUID ? crypto.randomUUID() : String(crypto.getRandomValues(new Uint32Array(4))));
-      const script = document.createElement("script");
-      script.textContent = `
-        window.__dgTelemetry = {
-          _t: ${JSON.stringify(token)},
-          getStats: () => {
-            window.dispatchEvent(new CustomEvent("__dg_req_stats", { detail: window.__dgTelemetry._t }));
-            return window.__dgTelemetryCached || "Calculating stats (logged below)...";
-          },
-          downloadCsv: (fn) => {
-            window.dispatchEvent(new CustomEvent("__dg_req_csv", { detail: { t: window.__dgTelemetry._t, fn } }));
-          }
-        };
-        window.addEventListener("__dg_res_stats", (e) => {
-          // Assign unconditionally: a null detail is the reset marker. Guarding
-          // on truthiness would keep reporting the previous session's numbers.
-          window.__dgTelemetryCached = e.detail;
-          if (e.detail) console.table(e.detail);
-        });
-      `;
-      (document.head || document.documentElement).appendChild(script);
-      script.remove();
-
-      window.addEventListener("__dg_req_stats", (e) => {
-        if (e.detail !== token) return;
-        const stats = telemetry.getStats();
-        window.dispatchEvent(new CustomEvent("__dg_res_stats", { detail: stats }));
-      });
-      window.addEventListener("__dg_req_csv", (e) => {
-        if (!e || !e.detail || e.detail.t !== token) return;
-        telemetry.downloadCsv(e.detail.fn);
-      });
-    } catch (e) {
-      // A page CSP without 'unsafe-inline' blocks the injected script, and the
-      // page-world half of the bridge then silently never exists.
-      console.warn("[Telemetry] page-world bridge unavailable:", e);
-    }
-  }
-  injectMainWorldBridge();
+  // No page-main-world bridge on purpose: an inline page script exposing
+  // getStats/downloadCsv is readable by every page script, so it would hand
+  // pages a page-triggered download capability into the user's Downloads
+  // folder. Inspect the isolated world ("JavaScript context: Extension")
+  // in DevTools for stats; nothing here is exposed page-side.
 
   chrome.runtime.onMessage.addListener((message) => {
     if (!message?.type) return;
@@ -607,11 +568,18 @@
       telemetry.add(record);
 
       if (action === ACTION.FINAL) {
+        // Text goes through %s as an argument, not the format string: ASR
+        // output can contain %c/%s/%O and would consume the style arguments.
         console.log(
-          `%c[ASR Final]%c "${text}" %c| ASR: ${record.asrDurationMs}ms | Sound→Subtitle: ${record.soundToSubtitleMs}ms (audio lag ${record.audioLagMs}ms) | Audio: ${record.audioSeconds}s`,
+          "%c[ASR Final]%c \"%s\" %c| ASR: %sms | Sound→Subtitle: %sms (audio lag %sms) | Audio: %ss",
           "color: #00e676; font-weight: bold",
           "color: #ffffff; font-weight: 500",
-          "color: #90caf9"
+          text,
+          "color: #90caf9",
+          record.asrDurationMs,
+          record.soundToSubtitleMs,
+          record.audioLagMs,
+          record.audioSeconds
         );
       }
       return;

@@ -606,12 +606,22 @@ async function stopSession(options={}) {
   await setState(finalState);
 }
 
-async function startSession(tabId, config) {
-  if(session) await stopSession();
-  intentionalStop=false;
+// Capture-start latch: loadVad/loadAsr take seconds, during which `session`
+// is still null — a second START would run a second capture picker and the
+// loser's stream would never be disposed. Set before the first await,
+// cleared on every exit.
+let startingCapture = false;
 
-  let displayStream=null, audioContext=null;
+async function startSession(tabId, config) {
+  if (startingCapture) return;
+  startingCapture = true;
+
   try {
+    if(session) await stopSession();
+    intentionalStop=false;
+
+    let displayStream=null, audioContext=null;
+    try {
     // Load VAD
     await setState(STATE.LOADING_VAD);
     await loadVad(); resetVadState();
@@ -633,7 +643,7 @@ async function startSession(tabId, config) {
     const [videoTrack] = displayStream.getVideoTracks();
     if(/live subtitle audio worker|chrome-extension/i.test(`${videoTrack?.label} ${audioTrack?.label}`)) {
       displayStream.getTracks().forEach(t=>t.stop());
-      await reportError("WRONG_CAPTURE_SOURCE","Choose the anime tab"); await setState(STATE.IDLE); return;
+      await reportError("WRONG_CAPTURE_SOURCE","Choose the tab you want subtitled"); await setState(STATE.IDLE); return;
     }
     if(!audioTrack) { displayStream.getTracks().forEach(t=>t.stop());
       await reportError("NO_AUDIO_TRACK","No shared audio"); await setState(STATE.IDLE); return; }
@@ -697,6 +707,9 @@ async function startSession(tabId, config) {
     if(err?.name==="NotAllowedError") { await reportError("CAPTURE_DENIED","Permission denied"); return; }
     if(err?.name==="NotFoundError") { await reportError("NO_AUDIO_TRACK","No shared audio"); return; }
     await reportError("START_FAILED", err?.message || "Unable to start");
+  }
+  } finally {
+    startingCapture = false;
   }
 }
 

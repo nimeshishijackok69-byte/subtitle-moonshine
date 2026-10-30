@@ -8,6 +8,10 @@ let activeTabId = null;
 let currentState = STATE.IDLE;
 let lastOverlayConfig = null;
 let lastTabMessageError = "";
+// Start latch: startSession has several awaits before it reaches the
+// currentState guard (getLiveOffscreenStatus), so two rapid Starts could both
+// observe IDLE and race. Set before the first await, cleared on every exit.
+let startingSession = false;
 const OFFSCREEN_KEEP_WARM_MS = 5 * 60 * 1000;
 let offscreenTeardownTimer = null;
 
@@ -163,69 +167,81 @@ async function ensureOverlayAndSend(tabId, message) {
 
 async function startSession({ tabId, config }) {
   cancelOffscreenTeardown();
-  const liveStatus = await getLiveOffscreenStatus();
-  if (liveStatus?.hasSession && liveStatus.state !== STATE.IDLE && liveStatus.state !== STATE.ERROR) {
+  if (startingSession) {
     return {
       ok: false,
-      error: "A session is already running. Click Stop, then start again."
+      error: "A start is already in progress. Click Stop, then start again."
     };
   }
-
-  // Only close if corrupted in error state; keep warm document alive
-  if (currentState === STATE.ERROR || liveStatus?.state === STATE.ERROR) {
-    await closeOffscreenDocumentIfPresent();
-    activeTabId = null;
-    currentState = STATE.IDLE;
-  }
-
-  if (currentState !== STATE.IDLE) {
-    return {
-      ok: false,
-      error: "A session is already running. Click Stop, then start again."
-    };
-  }
-
-  const overlayConfig = getOverlayConfig(config);
-
-  activeTabId = tabId;
-  lastOverlayConfig = overlayConfig;
-  currentState = STATE.CREATING_OFFSCREEN;
+  startingSession = true;
 
   try {
-    await ensureOverlayAndSend(tabId, {
-      type: MSG.CLEAR_ALL
-    });
-    await ensureOverlayAndSend(tabId, {
-      type: MSG.APPLY_SETTINGS,
-      config: overlayConfig
-    });
-    await ensureOffscreenDocument();
-    await chrome.runtime.sendMessage({
-      type: MSG.START,
-      target: "offscreen",
-      tabId,
-      config
-    });
-  } catch (error) {
-    // Without a reset the state stays CREATING_OFFSCREEN after a failed
-    // injection or offscreen creation, and every later Start is refused as
-    // "already running" — with no offscreen document to even stop. The popup
-    // still receives the error through the run().catch response path. The
-    // guard keeps an OFFSCREEN_STATE/ERROR update that already landed from
-    // being clobbered back to IDLE.
-    if (currentState === STATE.CREATING_OFFSCREEN) {
-      currentState = STATE.IDLE;
-      activeTabId = null;
-      // A failed start can leave a warm offscreen document behind with no
-      // session; hand it back to the deferred-teardown path.
-      if (await hasOffscreenDocument().catch(() => false)) {
-        scheduleOffscreenTeardown();
-      }
+    const liveStatus = await getLiveOffscreenStatus();
+    if (liveStatus?.hasSession && liveStatus.state !== STATE.IDLE && liveStatus.state !== STATE.ERROR) {
+      return {
+        ok: false,
+        error: "A session is already running. Click Stop, then start again."
+      };
     }
-    throw error;
-  }
 
-  return { ok: true };
+    // Only close if corrupted in error state; keep warm document alive
+    if (currentState === STATE.ERROR || liveStatus?.state === STATE.ERROR) {
+      await closeOffscreenDocumentIfPresent();
+      activeTabId = null;
+      currentState = STATE.IDLE;
+    }
+
+    if (currentState !== STATE.IDLE) {
+      return {
+        ok: false,
+        error: "A session is already running. Click Stop, then start again."
+      };
+    }
+
+    const overlayConfig = getOverlayConfig(config);
+
+    activeTabId = tabId;
+    lastOverlayConfig = overlayConfig;
+    currentState = STATE.CREATING_OFFSCREEN;
+
+    try {
+      await ensureOverlayAndSend(tabId, {
+        type: MSG.CLEAR_ALL
+      });
+      await ensureOverlayAndSend(tabId, {
+        type: MSG.APPLY_SETTINGS,
+        config: overlayConfig
+      });
+      await ensureOffscreenDocument();
+      await chrome.runtime.sendMessage({
+        type: MSG.START,
+        target: "offscreen",
+        tabId,
+        config
+      });
+    } catch (error) {
+      // Without a reset the state stays CREATING_OFFSCREEN after a failed
+      // injection or offscreen creation, and every later Start is refused as
+      // "already running" — with no offscreen document to even stop. The popup
+      // still receives the error through the run().catch response path. The
+      // guard keeps an OFFSCREEN_STATE/ERROR update that already landed from
+      // being clobbered back to IDLE.
+      if (currentState === STATE.CREATING_OFFSCREEN) {
+        currentState = STATE.IDLE;
+        activeTabId = null;
+        // A failed start can leave a warm offscreen document behind with no
+        // session; hand it back to the deferred-teardown path.
+        if (await hasOffscreenDocument().catch(() => false)) {
+          scheduleOffscreenTeardown();
+        }
+      }
+      throw error;
+    }
+
+    return { ok: true };
+  } finally {
+    startingSession = false;
+  }
 }
 
 async function stopSession() {
