@@ -1,3 +1,9 @@
 models/sensevoice/model.int8.onnx filter=lfs diff=lfs merge=lfs -text
 models/onnx/*.onnx filter=lfs diff=lfs merge=lfs -text
-lib/*.wasm filter=lfs diff=lfs merge=lfs -text
+# lib/*.wasm is deliberately NOT LFS. Every .wasm blob already in this repo's
+# history is a raw blob (the filter was never applied to them), so keeping them
+# off LFS makes a restore commit dedupe to the existing object instead of
+# pushing a fresh 24 MB LFS object and turning a plain binary into a 130-byte
+# pointer. A pointer reaches anyone who clones without `git lfs pull`, and for
+# lib/ort-wasm-simd-threaded.jsep.wasm that failure is invisible until runtime:
+# "no available backend found. ERR: [wasm] TypeError".

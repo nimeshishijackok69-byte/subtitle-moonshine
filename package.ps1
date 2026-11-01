@@ -12,15 +12,21 @@ $files = @(
   "manifest.json", "constants.js", "service_worker.js", "offscreen.js", "offscreen.html",
   "contentScript.js", "popup.js", "popup.html", "popup.css", "audio-worklet.js",
   "sensevoice-frontend.js", "README.md",
-  "lib\ort.min.js", "lib\ort-wasm-simd-threaded.mjs", "lib\ort-wasm-simd-threaded.wasm", "lib\silero_vad.onnx",
+  "lib\ort.min.js", "lib\ort-wasm-simd-threaded.mjs", "lib\ort-wasm-simd-threaded.wasm",
+  "lib\ort-wasm-simd-threaded.jsep.mjs", "lib\ort-wasm-simd-threaded.jsep.wasm", "lib\silero_vad.onnx",
   "models\sensevoice\frontend.json", "models\sensevoice\tokens.txt",
   "models\sensevoice\model.int8.onnx", "models\sensevoice\LICENSE"
 )
 # Deliberately EXCLUDED: docs\, context.md, implementation_plan.md,
 # deepseek_findings.md, models\onnx\ (dead Moonshine models, ~87 MB),
-# models\tokenizer*, models\*.json, lib\ort.all.min.js,
-# lib\ort-wasm-simd-threaded.jsep.*, .git\, .freebuff\ (dev server),
-# .commandcode\, .gitattributes
+# models\tokenizer*, models\*.json, lib\ort.all.min.js, .git\,
+# .freebuff\ (dev server), .commandcode\, .gitattributes
+#
+# lib\ort-wasm-simd-threaded.jsep.* is NOT dead. lib\ort.min.js is the ORT
+# webgpu bundle and requests "ort-wasm-simd-threaded.jsep.mjs" by name; dropping
+# it makes InferenceSession.create fail with "no available backend found.
+# ERR: [wasm] TypeError". The assertion below enforces that invariant instead
+# of trusting a hand-maintained comment.
 $excludedIfPresent = @(
   "models\onnx", "lib\ort.all.min.js"
 )
@@ -32,14 +38,46 @@ foreach ($rel in $excludedIfPresent) {
   if (Test-Path (Join-Path $repo $rel)) { throw "Excluded artifact unexpectedly present in repo: $rel" }
 }
 
-# Binary sanity: real weights, not LFS pointer stubs; sane minimum sizes.
+# Runtime-companion invariant: the ORT bundle resolves its wasm artifacts by
+# filename at runtime, so every name it references must exist on disk and be
+# packaged. A missing companion only surfaces in the browser, as
+# "no available backend found. ERR: [wasm] TypeError".
+$ortText = Get-Content "$repo\lib\ort.min.js" -Raw
+$ortRefs = @([regex]::Matches($ortText, 'ort-wasm-[A-Za-z0-9\.\-]+\.(?:mjs|wasm)') |
+  ForEach-Object { $_.Value } | Sort-Object -Unique)
+if ($ortRefs.Count -eq 0) { throw "no wasm artifact references found in lib\ort.min.js (minifier change?)" }
+# Transitive: a referenced .mjs loader names its own .wasm payload.
+foreach ($ref in @($ortRefs)) {
+  $refPath = Join-Path $repo "lib\$ref"
+  if ($ref -match '\.mjs$' -and (Test-Path $refPath)) {
+    $jsText = Get-Content $refPath -Raw
+    foreach ($m in [regex]::Matches($jsText, 'ort-wasm-[A-Za-z0-9\.\-]+\.wasm')) {
+      if ($ortRefs -notcontains $m.Value) { $ortRefs += $m.Value }
+    }
+  }
+}
+foreach ($name in $ortRefs) {
+  $rel = "lib\$name"
+  if (-not (Test-Path (Join-Path $repo $rel))) { throw "lib\ort.min.js requires $rel but it is missing" }
+  if ($files -notcontains $rel) { throw "$rel is required by lib\ort.min.js but absent from the allowlist" }
+}
+Write-Host "ORT runtime companions OK: $($ortRefs -join ', ')"
+
+# Binary sanity: real weights and real wasm modules, not LFS pointer stubs.
 $onnx = Join-Path $repo "models\sensevoice\model.int8.onnx"
-$vad  = Join-Path $repo "lib\silero_vad.onnx"
-$wasm = Join-Path $repo "lib\ort-wasm-simd-threaded.wasm"
 if ((Get-Item $onnx).Length -lt 200MB) { throw "model.int8.onnx too small (LFS pointer or corrupted?)" }
-foreach ($bin in @($onnx, $vad, $wasm)) {
-  $head = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($bin)[0..30])
-  if ($head -like "version https://git-lfs*") { throw "LFS pointer detected: $bin - run 'git lfs pull' first" }
+foreach ($rel in @($files | Where-Object { $_ -match '\.(onnx|wasm)$' })) {
+  $bin = Join-Path $repo $rel
+  $head = New-Object byte[] 32
+  $stream = [System.IO.File]::OpenRead($bin)
+  try { $read = $stream.Read($head, 0, 32) } finally { $stream.Dispose() }
+  if ($read -lt 32) { throw "file too small to be a model or wasm module: $rel" }
+  if ([System.Text.Encoding]::ASCII.GetString($head) -like "version https://git-lfs*") {
+    throw "LFS pointer detected: $rel - run 'git lfs pull' first"
+  }
+  if ($rel -match '\.wasm$' -and ($head[0] -ne 0x00 -or $head[1] -ne 0x61 -or $head[2] -ne 0x73 -or $head[3] -ne 0x6D)) {
+    throw "not a real wasm module (bad magic number): $rel"
+  }
 }
 $mib = [math]::Round((Get-Item $onnx).Length/1MB, 1)
 Write-Host "Package binary assertions OK (model.int8.onnx ~ $mib MB)"
