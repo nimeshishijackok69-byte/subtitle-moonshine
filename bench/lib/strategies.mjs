@@ -5,8 +5,19 @@ import { SAMPLE_RATE } from "./asr.mjs";
 
 const s = (sec) => Math.round(sec * SAMPLE_RATE);
 
+// Canonical fixed form is `fixed<windowSeconds>s<hopMs>`: fixed2s750 is a 2 s
+// window with a 750 ms hop. Parsed rather than enumerated so any window/hop pair
+// works, including the 4/6/8 s rows the browser's per-window timing buckets need
+// to be compared against.
+const FIXED = /^fixed(\d+(?:\.\d+)?)s(\d+)$/;
+const ALIASES = { fixed1s5_250: "fixed1.5s250" };
+
 export function getJobs(strategy, totalSamples) {
   const jobs = [];
+  const fixedMatch = FIXED.exec(ALIASES[strategy] || strategy);
+  if (fixedMatch) {
+    return fixed(totalSamples, Number(fixedMatch[1]), Number(fixedMatch[2]) / 1000);
+  }
   switch (strategy) {
     // Current extension behaviour: an utterance anchor grows to an 8 s cap,
     // decoded every 750 ms (first decode once MIN_UTTERANCE = 1 s is available).
@@ -24,14 +35,6 @@ export function getJobs(strategy, totalSamples) {
       }
       return jobs;
     }
-    // Fixed short window, small hop: constant per-tick cost, lower latency.
-    case "fixed2s250": return fixed(totalSamples, 2, 0.25);
-    case "fixed2s500": return fixed(totalSamples, 2, 0.5);
-    case "fixed2s750": return fixed(totalSamples, 2, 0.75);
-    case "fixed2s1000": return fixed(totalSamples, 2, 1.0);
-    case "fixed1s5_250": return fixed(totalSamples, 1.5, 0.25);
-    case "fixed3s500": return fixed(totalSamples, 3, 0.5);
-    case "fixed3s750": return fixed(totalSamples, 3, 0.75);
     // One decode per 8 s chunk: the floor for compute (accuracy reference).
     case "final8": {
       for (let start = 0; start < totalSamples; start += s(8)) {

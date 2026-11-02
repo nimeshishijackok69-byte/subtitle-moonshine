@@ -432,8 +432,48 @@ Two consequences:
    of the range rather than ~2×, which would mean a superlinear term (attention
    or memory traffic) that the GPU question actually depends on. If it is a
    smaller window that stalled, it is a scheduling artifact instead. The buckets
-   settle it on the next report; do not act on it before then.
+   would settle it on the next browser report; F-011 settles it from the bench
+   instead, and it is the 8 s window at the ordinary ~2.5x.
 
+### F-011 - Decode cost is linear in window size; the 655.6 ms max is the 8 s window, not a pathology (2026-11-02)
 
+F-010 left one number unattributed: the 655.6 ms worst decode, 87 % of the
+750 ms step. The browser cannot say which window produced it, so the same
+question was asked of the bench with the hop held at 750 ms and only the window
+varying. `bench/lib/strategies.mjs` now parses `fixed<window>s<hopMs>` instead of
+enumerating strategies, so any window/hop pair is expressible; existing names are
+unchanged (`fixed1s5_250` is kept as an alias for `fixed1.5s250`).
 
+Two sweeps, 4 threads, ep01 first 60 s, greedy, `p50RunMs` (`session.run` only,
+the quantity the browser reports):
 
+| Window | Session A | Session B | ms per audio second (A / B) |
+|---|---|---|---|
+| 2 s | 71.7 ms | 85.3 ms | 35.9 / 42.7 |
+| 4 s | 148.7 ms | 128.7 ms | 37.2 / 32.2 |
+| 6 s | 191.6 ms | 185.2 ms | 31.9 / 30.9 |
+| 8 s | 275.9 ms | 242.3 ms | 34.5 / 30.3 |
+
+Least-squares fit: A `y = 32.8x + 8.1`, B `y = 26.4x + 28.4`, largest residual
+7 % of the row value. Cost is **linear in window length at a fixed hop**, with a
+small fixed per-decode overhead and no superlinear term anywhere up to the 8 s
+cap. Per audio second decoded, the model costs **0.026-0.033x realtime** natively.
+
+Two things follow.
+
+**The 655.6 ms max is explained.** An 8 s window costs 242-276 ms natively, and
+655.6 / 260 is ~2.5x, which is exactly the 2.2-2.5x measured at 1-3 s. There is no
+superlinear WASM penalty, so nothing about the tail justifies a GPU port. The
+GPU question is closed, not merely deprioritised.
+
+**The cost of a long window is cadence, not throughput.** At the 8 s cap the
+browser decode is 87 % of the 750 ms tick. One overrun and the effective interim
+cadence becomes 1500 ms - precisely on the longest sentences, which are the ones
+where the reader is waiting longest for text. Duty cycle never exceeds 44 %, so
+nothing is dropped; the sentence simply updates half as often. Any future window
+policy should be judged on `p95RunMs / DECODE_STEP_MS`, not on mean duty.
+
+Measurement caveat: absolute values drift 25-50 % between sweeps on this machine
+(`fixed2s750` run-only came back at 56.3 / 71.7 / 85.3 ms across three sessions).
+Ratios within a sweep are stable; cross-sweep absolute comparisons are not. Quote
+a ratio or a same-sweep table, never a lone millisecond figure.
