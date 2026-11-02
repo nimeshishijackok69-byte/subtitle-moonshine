@@ -357,6 +357,54 @@ baseline to measure Chrome against is **~110 ms per decode for the shipped
 policy and ~56 ms for a 2 s window**, and a browser mean of 300–400 ms would be
 a 3–6× WASM penalty rather than a machine-specific anomaly.
 
+### F-010 — In the browser, WASM costs ~2× native and decode is 10 % of latency (2026-11-02)
+
+Measured from the live extension, not the bench: 4-minute session, 142.3 s of
+audio, 120 decodes, 4 WASM threads, `crossOriginIsolated true`, 12 logical cores,
+16 GB, NVIDIA Blackwell available but unused (`executionProviders: ["wasm"]`).
+
+| Metric | Value |
+|---|---|
+| `asr.inferMs` mean | 153.4 ms |
+| `asr.inferMs` max | 328.9 ms |
+| `asr.inferMs` last | 136.0 ms (window ≈ 1.57 s, from `asr.frames 29`) |
+| decodes / audio seconds | 120 / 142.3 |
+| duty cycle at `decodeStepMs 750` | 20 % mean, 44 % worst |
+| `pcm.queueDepth` | 0 (no dropped audio) |
+| `asr.loadMs` / `vad.loadMs` | 1452 ms / 310 ms |
+
+Against the native run-only numbers from F-009:
+
+| Window | Native `p50RunMs` | Browser | Ratio |
+|---|---|---|---|
+| ~1.5–2 s | 56.3 ms | 136–153 ms | 2.4–2.7× |
+| 8 s (assumed to be the 328.9 ms max) | 167.0 ms | 328.9 ms | 2.0× |
+
+So the WASM penalty on this machine is **~2.0–2.7×**, not the 3–6× the plan
+budgeted for. Decode is **10 % of the ~1.54 s end-to-end path** (750 ms tick +
+640 ms endpoint + 153 ms decode), with 4.9× headroom at the mean and 2.3× on the
+worst single decode.
+
+Consequences, and they reorder the roadmap a second time:
+
+- **A GPU port cannot buy visible latency here.** Perfect inference on the
+  current policy removes ~153 ms of ~1540 ms. The tick and the endpoint dominate.
+- **Accuracy is affordable now.** Beam-8 costs +11 ms native (F-008) → ~+27 ms in
+  WASM, paid against 640 ms of endpoint silence that is already being spent.
+  Hotword biasing and a beam-8 final belong before any backend change.
+- **The cheap latency levers are policy.** `DECODE_STEP_MS 750 → 500` costs
+  roughly +50 % decode wall (still ~30 % duty) and removes up to 250 ms of
+  perceived latency; `END_SILENCE 640 → 450 ms` removes ~190 ms more. Together
+  that is ~440 ms — three times what a perfect GPU port would buy — for two
+  constants and a re-tune of the endpoint heuristic.
+
+Caveats: one machine, one session, one clip (ep01). The 8 s attribution of the
+max decode is inferred from `asr.frames 29` for the *last* decode, not measured
+per decode; if the max came from a smaller window, the ratio is slightly worse
+and the conclusion does not change. `chrome 156.0.0.0` in that report is a
+Chromium build that withholds the full version from client hints, even though
+the report now asks for `fullVersionList`.
+
 
 
 

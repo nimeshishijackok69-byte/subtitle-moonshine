@@ -389,6 +389,16 @@ async function buildDiagnosticReport() {
     ["session keys", channelLine(session)]
   ];
 
+  // "Unknown message type." from the worker plus no mirrored keys is the
+  // signature of a worker still running an older build than the pages: pages are
+  // re-read from disk every time they open, the worker only re-registers on an
+  // extension reload. It has cost two real reports, so name the remedy here
+  // rather than leaving the reader to infer it from three question marks.
+  const staleWorker = !worker.ok && /unknown message type/i.test(worker.error || "") && mirrorKeys === 0;
+  if (staleWorker) {
+    queryRows.push(["", "stale worker build: reload the extension (chrome://extensions)"]);
+  }
+
   const workerRows = [
     ["state (mirrored)", stored["sw.state"] ?? "?"],
     ["tabId (mirrored)", stored["sw.tabId"] ?? "?"],

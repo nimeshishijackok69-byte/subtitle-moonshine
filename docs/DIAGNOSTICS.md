@@ -90,6 +90,19 @@ is unanswerable. The three channels are independent:
 the popup reads the mirrored `sw.*` keys directly instead of asking the worker
 to read them. Any one channel can fail and the report still carries the rest.
 
+When the worker reports `Unknown message type.` **and** no mirrored keys exist,
+a fourth line is appended:
+
+```
+worker      failed: Unknown message type. (2ms)
+            stale worker build: reload the extension (chrome://extensions)
+```
+
+That combination means the worker is running code older than the popup and the
+offscreen document. Extension pages are re-read from disk every time they open;
+the service worker only re-registers on an extension reload or update, so it is
+possible to have three contexts on two different builds. Observed twice.
+
 ### `[service worker]`
 
 ```
@@ -197,6 +210,7 @@ nothing to the report.
 | What you see | Read | Usually means |
 |---|---|---|
 | `[queries]` has any `failed:` line | `[queries]` | That channel is the bug, not the pipeline. `worker: no response` = the worker answered nothing; `offscreen: Could not establish connection` = the document is gone. |
+| `[queries] worker: Unknown message type.` and `mirror keys none written` | `[service worker]` | The worker is running an older build than the popup and offscreen document. Reload the extension at `chrome://extensions` — pages re-read from disk on open, the worker only re-registers on reload. |
 | Red dot, `[START_FAILED] no available backend found` | `[errors]` | ORT cannot load its wasm artifact. Check the `lib/` companion files exist — this exact failure was a deleted `ort-wasm-simd-threaded.jsep.mjs`. |
 | Red dot, `[CAPTURE_DENIED]` | `[errors]` | The user cancelled the share picker. Not a bug. |
 | Red dot, `[NO_AUDIO_TRACK]` | `[errors]` | The tab was shared without "Share audio", or has no audio at all. |
