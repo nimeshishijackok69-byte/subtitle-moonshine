@@ -145,13 +145,23 @@ The two that settle most arguments:
 ### `[timings]`
 
 ```
-offscreen.asr.inferMs n=42 last=210.4ms mean=210.0ms max=380.1ms
+offscreen.asr.inferMs        n=42 last=210.4ms mean=210.0ms max=380.1ms
+offscreen.asr.inferMs <=2s   n=18 last=143.0ms mean=141.2ms max=161.0ms
+offscreen.asr.inferMs <=4s   n=20 last=228.1ms mean=231.7ms max=268.4ms
 ```
 
 Count, last, mean, max per instrumented call site. The mean is not the useful
-number — `max` is. A mean of 210 ms with a max of 380 ms against a 750 ms step
+number - `max` is. A mean of 210 ms with a max of 380 ms against a 750 ms step
 is healthy; a mean of 210 ms with a max of 2400 ms is a machine that will drop
 audio, and the mean hides it.
+
+The window buckets exist because window size dominates cost and moves with the
+content: two sessions on the same machine, same model, same policy differed by
+51% in mean (`153.4` vs `232.2` ms) purely because one scene was 34% speech and
+the other 44%, which produces longer utterances and therefore larger decodes.
+The aggregate mean is only comparable to another session with the same mix; the
+bucketed rows are comparable to anything, including the bench, which reports a
+row per fixed window size. Read the bucket, then the `max` inside it.
 
 Deliberately measured *inside* the ASR lock, so this is inference cost and not
 queueing delay. Those are different failures with different fixes.

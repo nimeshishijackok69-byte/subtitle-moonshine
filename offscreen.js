@@ -159,7 +159,16 @@ async function runAsr(pcm) {
   // queued behind the previous decode. Those are different backlog problems.
   const startedAt = performance.now();
   const result = await asrSession.run(feeds);
-  DIAG.sample("asr.inferMs", performance.now() - startedAt);
+  const inferMs = performance.now() - startedAt;
+  DIAG.sample("asr.inferMs", inferMs);
+  // Window size dominates cost and moves with the scene, so a session mean is
+  // only comparable to another session with the same utterance-length mix: two
+  // runs on this machine differed by 51% in mean purely from speech density.
+  // Bucketing makes each sample attributable, and gives the bench a row with the
+  // same window to compare against.
+  const windowSec = pcm.length / TARGET_SAMPLE_RATE;
+  const bucket = windowSec <= 2 ? "<=2s" : windowSec <= 4 ? "<=4s" : windowSec <= 6 ? "<=6s" : "<=8s";
+  DIAG.sample(`asr.inferMs ${bucket}`, inferMs);
   DIAG.set("asr.frames", features.frames);
   DIAG.set("asr.dim", features.dim);
   DIAG.bump("asr.decodes");

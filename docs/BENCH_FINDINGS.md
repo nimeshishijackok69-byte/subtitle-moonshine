@@ -405,6 +405,35 @@ and the conclusion does not change. `chrome 156.0.0.0` in that report is a
 Chromium build that withholds the full version from client hints, even though
 the report now asks for `fullVersionList`.
 
+Addendum, second session (same machine, second scene, worker live):
+
+| Metric | Session 1 | Session 2 |
+|---|---|---|
+| decodes / audio | 120 / 142.3 s | 174 / 193.8 s |
+| `asr.inferMs` mean | 153.4 ms | 232.2 ms |
+| `asr.inferMs` max | 328.9 ms | **655.6 ms** |
+| speech share of VAD frames | 34 % | 44 % |
+| `pcm.queueDepth` | 0 | 0 |
+
+The mean moved 51 % and the max doubled with no code change, which rules out a
+regression and points at the mix: more speech density means longer utterances,
+and cost grows with window size. At matched windows the ratio is stable — the
+last decode was `asr.frames 19` ≈ 1.03 s at 112.7 ms (~2.2× the native 1.5 s
+figure) and the two before it, at 206 and 215 ms, look like ~3 s windows against
+a native ~90 ms (~2.4×).
+
+Two consequences:
+
+1. **A session mean is not a benchmark.** Only 2.0–2.7× survives as a claim, and
+   only per window. `asr.inferMs` is therefore now also sampled into `<=2s`,
+   `<=4s`, `<=6s`, `<=8s` buckets, which are directly comparable to a bench row.
+2. **The 655.6 ms max is the first number that could hurt.** It is 87 % of the
+   750 ms step. If it is an 8 s window, the browser costs ~4× native at the top
+   of the range rather than ~2×, which would mean a superlinear term (attention
+   or memory traffic) that the GPU question actually depends on. If it is a
+   smaller window that stalled, it is a scheduling artifact instead. The buckets
+   settle it on the next report; do not act on it before then.
+
 
 
 
