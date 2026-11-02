@@ -21,6 +21,8 @@ if (!audioPath) throw new Error("--audio is required");
 const threads = Number(arg("threads", 4));
 const limitSec = Number(arg("limit", 120));
 const outPath = arg("out");
+const progress = Boolean(arg("progress", false));
+const decodeTimeoutMs = Number(arg("decodeTimeout", 0));
 
 const pcmAll = loadPcm(audioPath);
 const pcm = pcmAll.subarray(0, Math.min(pcmAll.length, Math.round(limitSec * SAMPLE_RATE)));
@@ -38,12 +40,25 @@ for (const strategy of (arg("strategies", "current,fixed2s250,fixed1s5_250,final
     const frontends = [];
     const texts = [];
     const started = performance.now();
-    for (const job of jobs) {
-      const r = await asr.decode(pcm.subarray(job.start, job.end), { beamWidth });
+    for (let i = 0; i < jobs.length; i++) {
+      const job = jobs[i];
+      if (progress) {
+        process.stderr.write(`\r${strategy} beam=${beamWidth} [${i + 1}/${jobs.length}] window=${((job.end - job.start) / SAMPLE_RATE).toFixed(2)}s   `);
+      }
+      const decode = asr.decode(pcm.subarray(job.start, job.end), { beamWidth });
+      const r = decodeTimeoutMs > 0
+        ? await Promise.race([
+          decode,
+          new Promise((_, reject) => setTimeout(() => reject(new Error(
+            `decode timeout after ${decodeTimeoutMs}ms: ${strategy} job ${i + 1}/${jobs.length} window=${((job.end - job.start) / SAMPLE_RATE).toFixed(2)}s`
+          )), decodeTimeoutMs).unref?.())
+        ])
+        : await decode;
       walls.push(r.inferMs);
       frontends.push(r.frontendMs || 0);
       texts.push(r.text);
     }
+    if (progress) process.stderr.write("\n");
     const wallMs = performance.now() - started;
     const audioProcessed = jobs.reduce((a, j) => a + (j.end - j.start), 0) / SAMPLE_RATE;
     const sorted = [...walls].sort((a, b) => a - b);

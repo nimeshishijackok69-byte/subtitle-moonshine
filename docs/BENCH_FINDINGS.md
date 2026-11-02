@@ -158,4 +158,36 @@ Next accuracy step needs the reference transcripts: run a SOTA offline model
 against `bench/transcribe.mjs` output. Until then, only compute/latency claims
 are supported — no CER number exists yet, and none should be quoted.
 
+### F-006 — onnxruntime-node deadlocks on a specific decode (2026-11-02) — UNRESOLVED
+
+Evidence (reproduced twice):
+
+- The hop-frontier process ran **45 min with only 37 s of CPU** at 362 MB RSS —
+  blocked, not computing. No output beyond the previous section, no JSON written.
+- Re-run of `current` on a 20 s clip with `--progress --decodeTimeout 60000`:
+  jobs 1–26 completed (window growing 1.00 → 8.00 s, then 1.00 → 7.75 s), then
+  **job 27 (4.00 s window) hung until the 60 s watchdog fired** and exited 1.
+
+So the hang is not load-dependent or thermal: it reproduces at a specific job in
+a repeated `session.run` loop. Suspects, in order: onnxruntime-node 1.31.1 ×
+Node v26.12.1 interop, int8 dynamic-quant kernels with a reassigned input shape,
+or the intra-op thread pool after ~26 varied-shape runs.
+
+Consequences for any number collected so far:
+
+- **All timings from a process that also hung are suspect.** The beam table
+  (greedy 1784 ms vs beam 1267 ms) was produced while the stuck process held
+  362 MB, and beam being *faster* than greedy is implausible — treat it as
+  unverified until re-measured in isolation, with repeats.
+- Every strategy must run in its **own process** and be retried, not chained in
+  one loop; `matrix.mjs` now supports `--progress` and `--decodeTimeout <ms>`
+  so a hang is named instead of silently eating an hour.
+
+To do at home: re-run with `--decodeTimeout 30000` one strategy per process; if
+the deadlock persists, pin `onnxruntime-node` to a known-good version (e.g.
+1.20.x / 1.22.x) and/or test Node 22 LTS, then record which combination is
+stable before collecting timings. Do **not** quote throughput until a clean,
+repeatable run exists.
+
+
 
