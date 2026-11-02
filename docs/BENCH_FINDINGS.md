@@ -341,6 +341,22 @@ diagnostics report. If WASM is 3–4× slower than native, the headroom shrinks 
 12× to ~3×, which is still enough that the hop and the endpointing — not the
 model — set the latency.
 
+Addendum, same session: the table's `p50` is a whole decode — frontend +
+`session.run` + JS argmax — while the extension samples only `session.run`. A
+browser report must be compared against the run-only column, so `matrix.mjs` now
+records it. Separate sweep, same conditions:
+
+| Strategy | p50 whole decode | p50 `session.run` only |
+|---|---|---|
+| `current` | 116.0 ms | 108.2 ms |
+| `fixed2s750` | 60.4 ms | 56.3 ms |
+| `final8` | 185.7 ms | 167.0 ms |
+
+Frontend and argmax together are 5–18 ms; the rest is the model. So the native
+baseline to measure Chrome against is **~110 ms per decode for the shipped
+policy and ~56 ms for a 2 s window**, and a browser mean of 300–400 ms would be
+a 3–6× WASM penalty rather than a machine-specific anomaly.
+
 
 
 

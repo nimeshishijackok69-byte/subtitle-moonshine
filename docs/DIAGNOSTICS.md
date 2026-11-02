@@ -143,6 +143,11 @@ audio, and the mean hides it.
 Deliberately measured *inside* the ASR lock, so this is inference cost and not
 queueing delay. Those are different failures with different fixes.
 
+The clock wraps `session.run` only: feature extraction and the JS argmax are
+outside it. The bench reports a whole-decode `p50InferMs` *and* a run-only
+`p50RunMs`; compare a browser `asr.inferMs` against `p50RunMs`, never against
+`p50InferMs`, or the browser looks ~10 % faster than it is.
+
 ### `[last emissions]`
 
 ```

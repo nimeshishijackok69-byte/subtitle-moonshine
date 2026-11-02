@@ -51,6 +51,7 @@ for (const job of jobs) {
   rows.push({
     audioMs: Math.round(((job.end - job.start) / SAMPLE_RATE) * 1000),
     wallMs: Math.round(result.inferMs * 10) / 10,
+    runMs: Math.round(result.runMs * 10) / 10,
     frames: result.frames,
     chars: result.text.length
   });

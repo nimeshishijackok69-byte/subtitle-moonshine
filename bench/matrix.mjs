@@ -48,6 +48,7 @@ for (const strategy of (arg("strategies", "current,fixed2s250,fixed1s5_250,final
     const jobs = getJobs(strategy, pcm.length);
     const walls = [];
     const frontends = [];
+    const runTimes = [];
     const texts = [];
     const started = performance.now();
     for (let i = 0; i < jobs.length; i++) {
@@ -66,6 +67,7 @@ for (const strategy of (arg("strategies", "current,fixed2s250,fixed1s5_250,final
         : await decode;
       walls.push(r.inferMs);
       frontends.push(r.frontendMs || 0);
+      runTimes.push(r.runMs || 0);
       texts.push(r.text);
     }
     if (progress) process.stderr.write("\n");
@@ -73,6 +75,7 @@ for (const strategy of (arg("strategies", "current,fixed2s250,fixed1s5_250,final
     const audioProcessed = jobs.reduce((a, j) => a + (j.end - j.start), 0) / SAMPLE_RATE;
     const sorted = [...walls].sort((a, b) => a - b);
     const sortedFrontend = [...frontends].sort((a, b) => a - b);
+    const sortedRun = [...runTimes].sort((a, b) => a - b);
     const transcript = transcriptFor(strategy, jobs, texts);
     runs.push({
       strategy,
@@ -83,6 +86,11 @@ for (const strategy of (arg("strategies", "current,fixed2s250,fixed1s5_250,final
       p50InferMs: Math.round(pct(sorted, 0.5) * 10) / 10,
       p95InferMs: Math.round(pct(sorted, 0.95) * 10) / 10,
       p50FrontendMs: Math.round(pct(sortedFrontend, 0.5) * 10) / 10,
+      // session.run alone, no frontend and no argmax: this is the number the
+      // extension's asr.inferMs measures, so it is the only one a browser report
+      // can be compared against.
+      p50RunMs: Math.round(pct(sortedRun, 0.5) * 10) / 10,
+      p95RunMs: Math.round(pct(sortedRun, 0.95) * 10) / 10,
       chars: transcript.length,
       transcript
     });
