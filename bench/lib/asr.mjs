@@ -172,6 +172,20 @@ export class Asr {
       dim: V
     };
   }
+
+  // ORT owns an intra-op thread pool and a native allocator. Releasing the
+  // session is the only deterministic teardown a short-lived script has:
+  // skipping it left a finished process alive with an empty event loop (F-007).
+  async dispose() {
+    const session = this.session;
+    this.session = null;
+    if (!session) return;
+    try {
+      await session.release();
+    } catch (err) {
+      console.error(`[asr] session release failed: ${err?.message ?? err}`);
+    }
+  }
 }
 
 export const SAMPLE_RATE = 16000;

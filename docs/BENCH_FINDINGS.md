@@ -23,9 +23,19 @@ node run.mjs --audio "<raw>" --strategy current --beam 1 --limit 120 --out out/x
 # every strategy x beam on one clip, model loaded once
 node matrix.mjs --audio "<raw>" --limit 60 --threads 4 --out out/matrix.json
 
+# a full sweep, one process per strategy, with a hard wall-clock kill (F-007)
+powershell -NoProfile -ExecutionPolicy Bypass -File sweep.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File sweep.ps1 -Strategies final8 -Beams "1,8" -Repeats 3 -OutDir out\beam
+powershell -NoProfile -ExecutionPolicy Bypass -File sweep.ps1 -Strategies current,fixed2s750,final8 -Threads 1 -OutDir out\threads-t1
+
 # score against a reference transcript (produced later by a stronger model)
 node compare.mjs --reference ep01.srt --hypothesis out/ep01_current.txt
 ```
+
+Run sweeps through `sweep.ps1`, not a `foreach` loop. It starts each strategy as
+its own process, kills anything that overstays, and records `ok` / `EXIT HANG` /
+`TIMEOUT` per configuration. A bare loop will silently stall on the first process
+that cannot exit, which is not hypothetical (F-007).
 
 Audio input is raw `s16le`, 16 kHz, mono — the exact format the extension feeds
 its frontend. Convert with:
@@ -158,6 +168,10 @@ Next accuracy step needs the reference transcripts: run a SOTA offline model
 against `bench/transcribe.mjs` output. Until then, only compute/latency claims
 are supported — no CER number exists yet, and none should be quoted.
 
+**Status 2026-11-02 22:45:** the sweep ran. The hop frontier is F-009, the
+greedy/beam question is F-008, and the reason the first attempt stalled is
+F-007.
+
 ### F-006 — onnxruntime-node deadlocks on a specific decode (2026-11-02) — UNRESOLVED
 
 Evidence (reproduced twice):
@@ -188,6 +202,145 @@ the deadlock persists, pin `onnxruntime-node` to a known-good version (e.g.
 1.20.x / 1.22.x) and/or test Node 22 LTS, then record which combination is
 stable before collecting timings. Do **not** quote throughput until a clean,
 repeatable run exists.
+
+### F-007 — The harness could not terminate a finished process (2026-11-02) — mitigated
+
+Symptom: a run completes every decode, prints its summary, writes its JSON, and
+then never exits. First seen as a sweep that stalled for 30 minutes after
+`fixed2s500` had already produced its results (PID 20580: 31.6 s CPU, 345 MB
+RSS, 0.00 s CPU across a 6 s sample — finished, not computing).
+
+Isolation: one fresh process per teardown mode, the exact `fixed2s500` workload
+(117 decodes, 2 s window, 500 ms hop, 7.7 s of decode), 60 s kill deadline.
+
+| Teardown attempted | Exited |
+|---|---|
+| return from top level, let the loop drain | no |
+| `process.exit(0)` alone | no |
+| `session.release()`, then drain | no |
+| `session.release()`, then `process.exit(0)` | no |
+
+The block is therefore not the event loop, not ORT's JS API, and not something
+a script can fix from inside: `process.exit()` itself never returns. It is also
+**intermittent** — the same workload hung twice in two different harness
+versions, then completed in 9.4 s on a third run with identical code.
+
+Scope: `onnxruntime-node`'s native CPU EP. The shipped extension uses ORT Web
+with the WASM EP inside the offscreen document, so this is a bench defect, not a
+product defect. Do not "fix" `offscreen.js` for it.
+
+Relation to F-006: F-006 recorded a hang *during* decode (job 27, watchdog
+fired). That is a different manifestation — a decode that never returns versus a
+teardown that never returns — in the same native layer, and neither is fixed.
+When a future run hangs, check whether its output was already complete before
+assuming the decode stalled.
+
+Mitigation now in the harness:
+
+- `sweep.ps1` owns termination. It polls for `<out>.json.done`, which the runner
+  writes *before* releasing the session, waits `-GraceSec` (3 s), then kills and
+  reports `EXIT HANG` with the data intact. The old timeout path still exists
+  for a child that never writes results. One hung child can no longer eat a
+  sweep.
+- `matrix.mjs` persists its JSON after every configuration, so a kill loses at
+  most the configuration in flight.
+- The driver reads the JSON, not stdout. A killed child loses its piped output
+  (both logs were 0 B in the first `EXIT HANG` run) but keeps every file it
+  wrote — so stdout is a progress display, never the record.
+- `Asr.dispose()` releases the session and `lib/exit.mjs` drains stdio, which
+  makes the common case exit cleanly. Neither is a guarantee, which is why the
+  driver, not the runner, is the authority.
+
+### F-008 — Beam-8 is slower than greedy, as expected (2026-11-02)
+
+F-006 recorded "greedy 1784 ms vs beam-8 1267 ms" and flagged that beam being
+faster than greedy is implausible. It is not true. Re-measured in isolation,
+three repeats, one process each, `fixed2s750`, 60 s clip, 4 threads:
+
+| Repeat | Greedy p50 | Beam-8 p50 | Greedy wall | Beam-8 wall |
+|---|---|---|---|---|
+| 1 | 77.2 ms | 97.2 ms | 6.1 s | 7.4 s |
+| 2 | 63.0 ms | 74.2 ms | 5.0 s | 5.9 s |
+| 3 | 62.7 ms | 73.2 ms | 4.9 s | 5.8 s |
+
+Beam-8 costs 12–21 % more wall time and ~11–20 ms more per decode. The original
+number came from a process that was also hung (F-006) and must not be quoted.
+
+Accuracy signal available without a reference: the two decoders disagree by 18
+characters over 577 (3.1 % of beam length) and beam emits 11 more characters
+(577 vs 566), consistent with greedy dropping low-confidence characters. That is
+not evidence beam is better — only that it differs, that the difference is
+small, and that a ~12 % CPU premium on *finals only* is affordable. It is not
+affordable on every 750 ms tick, which is precisely the asymmetric-decode
+argument in PLAN_10X §3.
+
+### F-009 — The frontier, measured clean, and why compute was never the constraint (2026-11-02)
+
+First 60 s of ep01, greedy, 4 threads, one process per strategy, `sweep.ps1`,
+Node v22.23.2, onnxruntime-node 1.31.1, int8 model. `wall` is the measured decode
+loop; `× RT` is that wall as a fraction of the 60 s clip.
+
+| Strategy | Decodes | `computeOverRealtime` | p50 | p95 | wall | × RT |
+|---|---|---|---|---|---|---|
+| `current` (growing, 750 ms) | 82 | 6.25× | 131.9 ms | 247.1 ms | 11.3 s | 0.188 |
+| `fixed1s5_250` | 235 | 5.88× | 60.0 ms | 62.9 ms | 13.4 s | 0.223 |
+| `fixed2s250` | 233 | 7.77× | 73.8 ms | 77.1 ms | 16.5 s | 0.275 |
+| `fixed2s500` | 117 | 3.90× | 69.5 ms | 76.7 ms | 7.8 s | 0.130 |
+| `fixed2s750` | 78 | 2.60× | 69.6 ms | 76.6 ms | 5.0 s | 0.083 |
+| `fixed2s1000` | 59 | 1.97× | 64.2 ms | 76.9 ms | 3.8 s | 0.063 |
+| `fixed3s750` | 77 | 3.85× | 96.4 ms | 103.5 ms | 7.1 s | 0.118 |
+| `final8` | 8 | 1.00× | 176.5 ms | 198.5 ms | 1.3 s | 0.022 |
+
+Four things follow from the table, and they are not the things the plan assumed.
+
+**1. `computeOverRealtime` is geometry, not cost.** It is only `window ÷ hop`.
+Cost is `decodes × p50`, and `decodes = clip ÷ hop`, so cost per second of audio
+is `p50(window) ÷ hop`. The two rankings disagree: `fixed2s250` is the worst
+strategy on both measures (7.77× and 0.275× RT) while `fixed2s1000` is the best
+(1.97× and 0.063× RT), but `fixed1s5_250` beats `fixed2s500` on compute (5.88 vs
+3.90) and loses on wall (0.223 vs 0.130). Quoting only the geometric number, as
+PLAN_10X §2 does, can point at the wrong row.
+
+**2. Per-decode latency is nearly flat across 1.5–3 s windows** (60 → 96 ms) and
+only 2.5× at 8 s (176 ms). The window is a weak lever; the hop is the strong
+one. That is F-004's conclusion arriving from a second direction: a fixed window
+helps only because it is shorter than the average growing window (~4.6 s), and
+the only structural savings come from a larger hop or cross-tick state reuse.
+
+**3. Compute is not the binding constraint on this machine.** The shipped policy
+costs **0.188× realtime**; a 2 s window at the shipped 750 ms hop costs
+**0.083×**. There is roughly 12× headroom before decode cannot keep up. A 10×
+faster decode would therefore buy almost nothing in perceived latency, because
+the floor is `DECODE_STEP_MS = 750` plus `END_SILENCE = 640 ms` plus holdback —
+about 1.4 s of pure policy. The plan's premise, that decode speed is the 10×
+lever, does not hold on this hardware.
+
+**4. Thread scaling saturates before 4 and is only meaningful for varied
+windows.**
+
+| Threads | `current` p50 | `fixed2s750` p50 | `final8` p50 |
+|---|---|---|---|
+| 1 | 248.3 ms | 114.7 ms | 417.1 ms |
+| 2 | 186.1 ms | 104.7 ms | 243.0 ms |
+| 4 | 132.8 ms | 71.6 ms | 280.0 ms |
+
+4 threads is 1.87× / 1.60× faster than 1 for the two varied-window strategies.
+`final8` is inside the noise at n = 8 (4 threads is *worse* than 2, which is not
+a real effect) and must not be used for scaling claims.
+
+Caveats that bound all of the above: native CPU EP, not the browser's WASM EP,
+so absolute numbers do not transfer to the extension — the geometry conclusions
+do. 60 s of one episode; no reference transcript, so nothing here says which
+strategy is *more accurate*, only what each costs. The corpus is now 10 episodes
+(E11 is gone) and only ep01 has been re-extracted (1420.1 s, 43.3 MB) — any
+claim about episode-to-episode variance needs the rest of it re-encoded.
+
+The open question this leaves is the one worth measuring next: what the shipped
+pipeline actually costs inside Chrome, from the `[timings]` section of the
+diagnostics report. If WASM is 3–4× slower than native, the headroom shrinks from
+12× to ~3×, which is still enough that the hop and the endpointing — not the
+model — set the latency.
+
 
 
 

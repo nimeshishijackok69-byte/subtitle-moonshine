@@ -8,6 +8,7 @@ import { writeFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { Asr, loadPcm, SAMPLE_RATE } from "./lib/asr.mjs";
 import { getJobs, transcriptFor } from "./lib/strategies.mjs";
+import { exitEvidence, exitNow } from "./lib/exit.mjs";
 
 function arg(name, fallback) {
   const i = process.argv.indexOf(`--${name}`);
@@ -33,6 +34,15 @@ await asr.decode(pcm.subarray(0, Math.min(pcm.length, SAMPLE_RATE * 2))); // war
 const pct = (arr, q) => arr.length ? arr[Math.min(arr.length - 1, Math.floor(arr.length * q))] : 0;
 
 const runs = [];
+const result = { audio: path.basename(audioPath), clipSec, threads, runs };
+
+// Persist after every run, not only at the end: a sweep killed during its last
+// configuration must still leave the earlier rows on disk.
+function persist(extra) {
+  if (!outPath) return;
+  mkdirSync(path.dirname(outPath), { recursive: true });
+  writeFileSync(outPath, JSON.stringify(extra ? { ...result, ...extra } : result, null, 2));
+}
 for (const strategy of (arg("strategies", "current,fixed2s250,fixed1s5_250,final8") + "").split(",")) {
   for (const beamWidth of (arg("beams", "1,8") + "").split(",").map(Number)) {
     const jobs = getJobs(strategy, pcm.length);
@@ -79,11 +89,24 @@ for (const strategy of (arg("strategies", "current,fixed2s250,fixed1s5_250,final
     console.log(`${strategy.padEnd(14)} beam=${beamWidth}  decodes=${String(jobs.length).padStart(3)}  ` +
       `compute=${String(runs.at(-1).computeOverRealtime).padStart(5)}x  p50=${String(runs.at(-1).p50InferMs).padStart(7)}ms  p95=${String(runs.at(-1).p95InferMs).padStart(7)}ms  ` +
       `frontendP50=${String(runs.at(-1).p50FrontendMs).padStart(6)}ms`);
+    persist();
   }
 }
 
+// Evidence before release: whatever is listed here is what the run left
+// behind, which is the state that decides whether the process can exit (F-007).
+const exit = exitEvidence();
+persist({ exit });
+
 if (outPath) {
-  mkdirSync(path.dirname(outPath), { recursive: true });
-  writeFileSync(outPath, JSON.stringify({ audio: path.basename(audioPath), clipSec, threads, runs }, null, 2));
+  // Completion marker, written before release: the sweep driver kills a process
+  // that will not exit, and must know whether the results on disk are whole
+  // before it does.
+  writeFileSync(`${outPath}.done`, JSON.stringify({ at: new Date().toISOString(), ...exit }));
   console.log(`\nwrote ${outPath}`);
 }
+
+// Release is best-effort and can block inside native teardown, so it happens
+// only after the results are on disk.
+await asr.dispose();
+await exitNow(0);

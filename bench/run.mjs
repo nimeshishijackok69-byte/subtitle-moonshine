@@ -11,6 +11,7 @@ import { writeFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { Asr, loadPcm, SAMPLE_RATE } from "./lib/asr.mjs";
 import { getJobs, transcriptFor } from "./lib/strategies.mjs";
+import { exitEvidence, exitNow } from "./lib/exit.mjs";
 
 function arg(name, fallback) {
   const i = process.argv.indexOf(`--${name}`);
@@ -87,8 +88,21 @@ const summary = {
 console.log(JSON.stringify(summary, null, 2));
 console.log(`\n--- transcript (${transcript.length} chars) ---\n${transcript.slice(0, 1500)}${transcript.length > 1500 ? "\n…" : ""}`);
 
+// Evidence before release: whatever is listed here is what the run left
+// behind, which is the state that decides whether the process can exit (F-007).
+const exit = exitEvidence();
+
 if (outPath) {
   mkdirSync(path.dirname(outPath), { recursive: true });
-  writeFileSync(outPath, JSON.stringify({ summary, rows, transcript }, null, 2));
+  writeFileSync(outPath, JSON.stringify({ summary, rows, transcript, exit }, null, 2));
+  // Completion marker, written before release: the sweep driver kills a process
+  // that will not exit, and must know whether the results on disk are whole
+  // before it does.
+  writeFileSync(`${outPath}.done`, JSON.stringify({ at: new Date().toISOString(), ...exit }));
   console.log(`\nwrote ${outPath}`);
 }
+
+// Release is best-effort and can block inside native teardown, so it happens
+// only after the results are on disk.
+await asr.dispose();
+await exitNow(0);
