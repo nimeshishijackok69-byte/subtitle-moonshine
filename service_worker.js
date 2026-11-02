@@ -1,7 +1,40 @@
 import "./constants.js";
+import "./diagnostics.js";
 
 const { MSG, STATE } = globalThis.LIVE_SUBS;
+const DIAG = globalThis.LIVE_DIAG;
+DIAG.install();
 const OFFSCREEN_DOCUMENT = "offscreen.html";
+
+// ─── Diagnostics state mirror ───────────────────────────────────────
+// MV3 terminates this worker after ~30 s idle, and currentState/activeTabId
+// live in module memory. A restarted worker therefore reports "idle" while a
+// session is still running. Mirroring to storage.session makes that desync
+// visible in a report instead of silently resetting the popup, and it keeps
+// the last error alive after the offscreen document that raised it is closed.
+let workerBoots = 0;
+const bootCountReady = chrome.storage.session
+  .get("sw.boots")
+  .then((stored) => {
+    workerBoots = Number(stored["sw.boots"] || 0) + 1;
+    return chrome.storage.session.set({ "sw.boots": workerBoots });
+  })
+  .catch(() => {});
+
+function mirrorState() {
+  chrome.storage.session
+    .set({
+      "sw.state": currentState,
+      "sw.tabId": activeTabId,
+      "sw.bootId": DIAG.bootId,
+      "sw.updatedAt": Date.now()
+    })
+    .catch(() => {});
+}
+
+function mirrorError(error) {
+  chrome.storage.session.set({ "sw.lastError": error }).catch(() => {});
+}
 
 let creatingOffscreen = null;
 let activeTabId = null;
@@ -104,6 +137,7 @@ async function getLiveOffscreenStatus() {
 
     currentState = status.state || currentState;
     activeTabId = status.tabId || activeTabId;
+    mirrorState();
     if (!status.hasSession && currentState === STATE.IDLE) {
       activeTabId = null;
     }
@@ -189,6 +223,7 @@ async function startSession({ tabId, config }) {
       await closeOffscreenDocumentIfPresent();
       activeTabId = null;
       currentState = STATE.IDLE;
+      mirrorState();
     }
 
     if (currentState !== STATE.IDLE) {
@@ -203,6 +238,7 @@ async function startSession({ tabId, config }) {
     activeTabId = tabId;
     lastOverlayConfig = overlayConfig;
     currentState = STATE.CREATING_OFFSCREEN;
+    mirrorState();
 
     try {
       await ensureOverlayAndSend(tabId, {
@@ -229,6 +265,7 @@ async function startSession({ tabId, config }) {
       if (currentState === STATE.CREATING_OFFSCREEN) {
         currentState = STATE.IDLE;
         activeTabId = null;
+        mirrorState();
         // A failed start can leave a warm offscreen document behind with no
         // session; hand it back to the deferred-teardown path.
         if (await hasOffscreenDocument().catch(() => false)) {
@@ -248,6 +285,7 @@ async function stopSession() {
   if (!(await hasOffscreenDocument())) {
     currentState = STATE.IDLE;
     activeTabId = null;
+    mirrorState();
     chrome.runtime.sendMessage({
       type: MSG.STATE,
       state: STATE.IDLE
@@ -260,6 +298,53 @@ async function stopSession() {
     target: "offscreen"
   });
   return { ok: true };
+}
+
+// Collects the report from every context that still exists. The offscreen
+// document is queried live but may already be gone (the error path closes it),
+// so the mirrored copy in storage.session is what makes a post-mortem possible.
+//
+// Every step is isolated. A failing getContexts() or storage read must degrade
+// one section, not reject the whole response, because the caller has no way to
+// tell "the worker is broken" from "there is nothing to report".
+async function collectDiagnostics() {
+  await bootCountReady;
+
+  let hasOffscreen = false;
+  try {
+    hasOffscreen = await hasOffscreenDocument();
+  } catch (error) {
+    DIAG.record("sw", "warn", `getContexts failed: ${error.message}`);
+  }
+
+  let offscreen = null;
+  if (hasOffscreen) {
+    try {
+      offscreen = await chrome.runtime.sendMessage({
+        type: MSG.GET_DIAGNOSTICS,
+        target: "offscreen"
+      });
+    } catch (error) {
+      DIAG.record("sw", "warn", `offscreen diagnostics unavailable: ${error.message}`);
+    }
+  }
+
+  const stored = await chrome.storage.session
+    .get(["sw.state", "sw.tabId", "sw.bootId", "sw.updatedAt", "sw.boots", "sw.lastError"])
+    .catch((error) => {
+      DIAG.record("sw", "warn", `session storage read failed: ${error.message}`);
+      return {};
+    });
+
+  return {
+    ok: true,
+    serviceWorker: DIAG.snapshot(),
+    offscreen: offscreen?.snapshot || null,
+    offscreenStatus: offscreen?.status || null,
+    hasOffscreen: Boolean(offscreen),
+    stored: stored || {},
+    workerBoots
+  };
 }
 
 async function applySettings({ tabId, config }) {
@@ -309,6 +394,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           tabId: activeTabId
         };
 
+      case MSG.GET_DIAGNOSTICS:
+        return collectDiagnostics();
+
       case MSG.OFFSCREEN_STATE:
         currentState = message.state;
         if (message.state === STATE.IDLE) {
@@ -317,6 +405,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         } else {
           cancelOffscreenTeardown();
         }
+        mirrorState();
         chrome.runtime.sendMessage({
           type: MSG.STATE,
           state: message.state
@@ -326,10 +415,23 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
         return { ok: true };
 
-      case MSG.OFFSCREEN_ERROR:
+      case MSG.OFFSCREEN_ERROR: {
         cancelOffscreenTeardown();
         currentState = STATE.ERROR;
         activeTabId = null;
+        // The failure path closes the offscreen document at the end of this
+        // case, taking its ring buffer with it. The error is copied here and
+        // mirrored before that happens, or the report a user sends afterwards
+        // has no cause in it. Awaited deliberately: fire-and-forget could be
+        // cut short by the document teardown.
+        const failure = {
+          code: message.code || "UNKNOWN",
+          message: message.message || "",
+          t: Date.now()
+        };
+        DIAG.attachError(failure.code, failure.message);
+        await mirrorError(failure);
+        mirrorState();
         chrome.runtime.sendMessage({
           type: MSG.STATE,
           state: STATE.ERROR
@@ -341,6 +443,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }).catch(() => {});
         await closeOffscreenDocumentIfPresent();
         return { ok: true };
+      }
 
       case MSG.OFFSCREEN_TRANSCRIPT:
         await ensureOverlayAndSend(message.tabId, {

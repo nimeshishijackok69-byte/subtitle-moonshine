@@ -61,8 +61,9 @@ popup → service worker → offscreen document → AudioWorklet → 16 kHz PCM
 | `manifest.json` | MV3 manifest, permissions, CSP, cross-origin isolation headers |
 | `constants.js` | Message types and session states |
 | `service_worker.js` | Offscreen lifecycle, tab injection, message relay |
-| `popup.html` / `popup.js` / `popup.css` | Controls, persisted settings, status |
+| `popup.html` / `popup.js` / `popup.css` | Controls, persisted settings, status, diagnostics copy |
 | `offscreen.html` / `offscreen.js` | Capture, VAD, inference, committer |
+| `diagnostics.js` | Bounded event ring, timings, and the report renderer shared by all contexts |
 | `audio-worklet.js` | Filter, resample, Int16 chunking |
 | `sensevoice-frontend.js` | fbank + LFR + CMVN |
 | `contentScript.js` | Overlay, drag/close, telemetry |
@@ -72,7 +73,9 @@ popup → service worker → offscreen document → AudioWorklet → 16 kHz PCM
 
 ## Errors
 
-`CAPTURE_DENIED`, `NO_AUDIO_TRACK`, `WRONG_CAPTURE_SOURCE` (you shared the extension's own page), `START_FAILED`, `AUDIO_PROCESS_ERROR`. The popup shows the message and the offscreen document is torn down.
+`CAPTURE_DENIED`, `NO_AUDIO_TRACK`, `WRONG_CAPTURE_SOURCE` (you shared the extension's own page), `START_FAILED`, `AUDIO_PROCESS_ERROR`. The popup shows the code and message, and the offscreen document is torn down.
+
+For anything that is not self-explanatory, press **Copy diagnostics** in the popup and paste the result. It carries the version, hardware capabilities, state machine, decode timings, VAD counters and the last 60 log lines — enough to diagnose without a second round-trip. What it contains, what it deliberately excludes, and how to read it: [`docs/DIAGNOSTICS.md`](docs/DIAGNOSTICS.md).
 
 ## Telemetry
 

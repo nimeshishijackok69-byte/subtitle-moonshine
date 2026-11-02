@@ -1,4 +1,6 @@
 const { MSG, STATE } = globalThis.LIVE_SUBS;
+const DIAG = globalThis.LIVE_DIAG;
+DIAG.install();
 
 const TARGET_SAMPLE_RATE = 16000;
 const VAD_FRAME_SAMPLES = 512;
@@ -23,6 +25,15 @@ const RING_BUFFER_SECONDS = 20;
 const RING_BUFFER_SAMPLES = RING_BUFFER_SECONDS * TARGET_SAMPLE_RATE;
 const ASR_WASM_THREADS = globalThis.crossOriginIsolated ? 4 : 1;
 
+// Engine identity, recorded once: every "it is slow" report needs the thread
+// count and isolation state, because 1 thread versus 4 is a 3x difference and
+// both are silent in the UI.
+DIAG.set("engine.sampleRate", TARGET_SAMPLE_RATE);
+DIAG.set("engine.threads", ASR_WASM_THREADS);
+DIAG.set("engine.crossOriginIsolated", Boolean(globalThis.crossOriginIsolated));
+DIAG.set("engine.decodeStepMs", DECODE_STEP_MS);
+DIAG.set("engine.maxWindowS", MAX_UTTERANCE_SAMPLES / TARGET_SAMPLE_RATE);
+
 let session = null;
 let intentionalStop = false;
 let offscreenState = STATE.IDLE;
@@ -32,6 +43,7 @@ let vadSession = null, vadState = null, vadSr = null, vadContext = null, vadLoad
 
 async function loadVad() {
   if (vadLoaded) return;
+  const startedAt = performance.now();
   const wasmDir = chrome.runtime.getURL("lib/");
   ort.env.wasm.wasmPaths = wasmDir;
   ort.env.wasm.numThreads = ASR_WASM_THREADS;
@@ -41,6 +53,8 @@ async function loadVad() {
   resetVadState();
   vadSr = new ort.Tensor("int64", BigInt64Array.from([BigInt(TARGET_SAMPLE_RATE)]), []);
   vadLoaded = true;
+  DIAG.set("vad.loadMs", Math.round(performance.now() - startedAt));
+  DIAG.mark("vad", "loaded");
 }
 
 function resetVadState() {
@@ -84,6 +98,7 @@ function parseTokenTable(text) {
 
 async function loadAsr() {
   if (asrLoaded) return;
+  const startedAt = performance.now();
   ort.env.wasm.wasmPaths = chrome.runtime.getURL("lib/");
   ort.env.wasm.numThreads = ASR_WASM_THREADS;
 
@@ -100,6 +115,10 @@ async function loadAsr() {
     { executionProviders: ["wasm"], graphOptimizationLevel: "all" }
   );
   asrLoaded = true;
+  DIAG.set("asr.model", SENSEVOICE_MODEL);
+  DIAG.set("asr.loadMs", Math.round(performance.now() - startedAt));
+  DIAG.set("asr.inputs", asrSession.inputNames.join(","));
+  DIAG.mark("asr", "session created");
 }
 
 function decodeSenseVoice(logits) {
@@ -136,7 +155,14 @@ async function runAsr(pcm) {
     language: new ort.Tensor("int32", Int32Array.of(asrFrontend.language), [1]),
     text_norm: new ort.Tensor("int32", Int32Array.of(asrFrontend.textNorm), [1])
   };
+  // Timed inside the lock, so this separates inference cost from time spent
+  // queued behind the previous decode. Those are different backlog problems.
+  const startedAt = performance.now();
   const result = await asrSession.run(feeds);
+  DIAG.sample("asr.inferMs", performance.now() - startedAt);
+  DIAG.set("asr.frames", features.frames);
+  DIAG.set("asr.dim", features.dim);
+  DIAG.bump("asr.decodes");
   return decodeSenseVoice(result.logits);
 }
 
@@ -510,6 +536,8 @@ async function processPcmChunk(current, arrayBuffer) {
 
   const int16 = new Int16Array(arrayBuffer);
   current.ring.append(int16);
+  DIAG.bump("pcm.chunks");
+  DIAG.set("pcm.queueDepth", current.pcmQueue.length);
 
   if (current.vadPending.length) {
     const merged = new Int16Array(current.vadPending.length + int16.length);
@@ -530,6 +558,9 @@ async function processPcmChunk(current, arrayBuffer) {
     const probability = await runVad(float32);
     if (session !== current || intentionalStop || current.stopping) return;
 
+    DIAG.bump(probability >= VAD_SPEECH_THRESHOLD ? "vad.speechFrames" : "vad.idleFrames");
+    DIAG.set("vad.lastP", Math.round(probability * 1000) / 1000);
+
     const frameStart = current.vadAbs;
     current.vadAbs += VAD_FRAME_SAMPLES;
     handleVadFrame(current, probability, frameStart, current.vadAbs);
@@ -540,9 +571,13 @@ async function processPcmChunk(current, arrayBuffer) {
 function sendMsg(msg) { return chrome.runtime.sendMessage(msg).catch(()=>{}); }
 function setState(state) {
   offscreenState = state;
+  DIAG.mark("offscreen", `state -> ${state}`);
   return sendMsg({type:MSG.OFFSCREEN_STATE, state});
 }
-function reportError(code,message) { return sendMsg({type:MSG.OFFSCREEN_ERROR, code, message}); }
+function reportError(code,message) {
+  DIAG.attachError(code, message);
+  return sendMsg({type:MSG.OFFSCREEN_ERROR, code, message});
+}
 
 function getStatus() {
   return {
@@ -556,6 +591,7 @@ function getStatus() {
 
 async function forwardTranscript(tabId, event) {
   if (!event) return;
+  DIAG.addTranscript(event);
   await sendMsg({
     type: MSG.OFFSCREEN_TRANSCRIPT,
     tabId,
@@ -632,6 +668,9 @@ async function startSession(tabId, config) {
   try {
     if(session) await stopSession();
     intentionalStop=false;
+    // A previous failure's error would otherwise dominate the next report and
+    // send every diagnosis down the wrong path.
+    DIAG.clearError();
     // Snap AFTER the stale-session stop above: any stopSession() from here on
     // (a user Stop during model load or capture) bumps the epoch and aborts
     // this start at the next check.
@@ -717,6 +756,7 @@ async function startSession(tabId, config) {
       stopping: false
     };
     const current = session;
+    DIAG.set("session.chunkMs", config.chunkMs || 25);
 
     audioTrack.addEventListener("ended", () => { if(session===current && !intentionalStop) stopSession(); });
     workletNode.port.onmessage = (e) => {
@@ -749,5 +789,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if(msg.type===MSG.START) { startSession(msg.tabId, msg.config); sendResponse({ok:true}); return false; }
   if(msg.type===MSG.STOP) { stopSession(); sendResponse({ok:true}); return false; }
   if(msg.type===MSG.GET_STATUS) { sendResponse(getStatus()); return false; }
+  if(msg.type===MSG.GET_DIAGNOSTICS) {
+    sendResponse({ok:true, snapshot: DIAG.snapshot(), status: getStatus()});
+    return false;
+  }
   sendResponse({ok:false, error:"Unknown message type"}); return false;
 });

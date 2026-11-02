@@ -11,7 +11,7 @@ $zipPath = Join-Path (Split-Path $repo -Parent) "subtitle-moonshine-$version.zip
 $files = @(
   "manifest.json", "constants.js", "service_worker.js", "offscreen.js", "offscreen.html",
   "contentScript.js", "popup.js", "popup.html", "popup.css", "audio-worklet.js",
-  "sensevoice-frontend.js", "README.md",
+  "diagnostics.js", "sensevoice-frontend.js", "README.md",
   "lib\ort.min.js", "lib\ort-wasm-simd-threaded.mjs", "lib\ort-wasm-simd-threaded.wasm",
   "lib\ort-wasm-simd-threaded.jsep.mjs", "lib\ort-wasm-simd-threaded.jsep.wasm", "lib\silero_vad.onnx",
   "models\sensevoice\frontend.json", "models\sensevoice\tokens.txt",
@@ -62,6 +62,30 @@ foreach ($name in $ortRefs) {
   if ($files -notcontains $rel) { throw "$rel is required by lib\ort.min.js but absent from the allowlist" }
 }
 Write-Host "ORT runtime companions OK: $($ortRefs -join ', ')"
+
+# Script-graph invariant: every file an extension page loads, every static
+# import in the worker, and every getURL() asset must be packaged. The allowlist
+# is hand-maintained and a new file is easy to forget; the failure is an
+# extension that throws on load, which no binary check would catch.
+$scriptRefs = @()
+foreach ($page in @("popup.html", "offscreen.html")) {
+  $html = Get-Content (Join-Path $repo $page) -Raw
+  foreach ($m in [regex]::Matches($html, '<script[^>]*\ssrc="([^"]+)"')) { $scriptRefs += $m.Groups[1].Value }
+}
+foreach ($js in @("service_worker.js", "offscreen.js", "popup.js")) {
+  $text = Get-Content (Join-Path $repo $js) -Raw
+  foreach ($m in [regex]::Matches($text, 'import\s+"([^"]+)"')) { $scriptRefs += $m.Groups[1].Value }
+  foreach ($m in [regex]::Matches($text, 'getURL\(\s*"([^"]+)"')) { $scriptRefs += $m.Groups[1].Value }
+}
+$allowNorm = @($files | ForEach-Object { $_ -replace '\\', '/' })
+# A trailing slash is a directory (wasmPaths), not a file; the artifact names it
+# resolves are covered by the ORT companion check above.
+$scriptRefs = @($scriptRefs | ForEach-Object { $_.TrimStart("./") } |
+  Where-Object { $_ -notlike '*/' } | Sort-Object -Unique)
+foreach ($ref in $scriptRefs) {
+  if ($allowNorm -notcontains $ref) { throw "$ref is loaded at runtime but missing from the allowlist" }
+}
+Write-Host "Script graph OK: $($scriptRefs.Count) entries"
 
 # Binary sanity: real weights and real wasm modules, not LFS pointer stubs.
 $onnx = Join-Path $repo "models\sensevoice\model.int8.onnx"

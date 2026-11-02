@@ -178,6 +178,20 @@ button:disabled {
   background: #f4f1e8;
 }
 
+.diagnostics {
+  gap: 6px;
+}
+
+.diagnostics .hint {
+  line-height: 1.35;
+}
+
+button.copied {
+  border-color: #0f766e;
+  background: #d8f3ee;
+  color: #0f766e;
+}
+
 .hint {
   color: #667174;
   font-size: 12px;

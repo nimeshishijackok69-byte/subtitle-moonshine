@@ -45,9 +45,17 @@
         <button id="start" type="button" class="primary">Start</button>
         <button id="stop" type="button" class="danger">Stop</button>
       </section>
+
+      <section class="section diagnostics">
+        <button id="copyDiagnostics" type="button" class="secondary">Copy diagnostics</button>
+        <p class="hint">
+          Version, state, timings and the last errors. No audio, no tab titles, no URLs.
+        </p>
+      </section>
     </main>
 
     <script src="constants.js"></script>
+    <script src="diagnostics.js"></script>
     <script src="popup.js"></script>
   </body>
 </html>
