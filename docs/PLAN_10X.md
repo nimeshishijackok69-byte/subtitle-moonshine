@@ -18,7 +18,7 @@ Product: Chrome MV3 extension, on-device live Japanese ASR for a user-selected t
 >    2 s @ 250 ms measured 7.77× vs the shipped 6.25×. The shipped policy
 >    already has ~12× headroom (0.188× realtime).
 > 4. **The affordable path is policy first, accuracy second:** 500 ms tick +
->    ~450 ms endpoint (~440 ms), then beam-8 on finals only (+12–21 % on a
+>    ~480 ms endpoint (~285-410 ms), then beam-8 on finals only (+12-21 % on a
 >    decode that fits inside the endpoint silence), then hotword biasing.
 >
 > Sections §2, §3 ("asymmetric decode" conclusion still holds, the GPU wording
@@ -41,7 +41,7 @@ Product: Chrome MV3 extension, on-device live Japanese ASR for a user-selected t
 
 > The table and numbers in this section describe the **measured baseline**, taken
 > before the policy change: `DECODE_STEP_MS = 750`, `END_SILENCE_SAMPLES = 0.64 s`.
-> Shipped now: **500 ms / 450 ms** (see §2). Every measurement in
+> Shipped now: **500 ms tick / 15 frames (480 ms) endpoint** (see §2). Every measurement in
 > `docs/BENCH_FINDINGS.md` refers to the baseline values.
 
 ### Two structural facts
@@ -49,7 +49,7 @@ Product: Chrome MV3 extension, on-device live Japanese ASR for a user-selected t
 1. **The decode re-reads the whole window.** At the baseline, every 750 ms the entire 0 → 8 s window was re-decoded. Measured cost was 6.25× realtime against 1.00× for a single pass — real, but **not binding**: 0.188× realtime overall, ~12× headroom (F-009).
 2. **The GPU path is present but unused.** `lib/ort.min.js` is the **WebGPU** ORT bundle (the reason the jsep companion had to be restored in `ef871c8`), yet `loadAsr()` hardcodes `executionProviders: ["wasm"]`. F-010/F-011 closed this as a lever — do not wire it up.
 
-Consequence: even with instant inference the experience is bounded at ~1.5 s, because the tick, endpoint and 4-char holdback dominate. Cutting the two policy constants to 500 ms / 450 ms is worth ~440 ms; the model is not the constraint.
+Consequence: even with instant inference the experience is bounded at ~1.5 s, because the tick, endpoint and 4-char holdback dominate. Cutting the two policy constants to 500 ms / 480 ms is worth ~285-410 ms; the model is not the constraint.
 
 ---
 
@@ -59,18 +59,18 @@ Consequence: even with instant inference the experience is bounded at ~1.5 s, be
 |---|---|---|---|
 | ~~**WebGPU EP + fp16 model**~~ **CLOSED (F-010/F-011)** — WASM is only 2.0–2.7× native and cost is linear in window length; a perfect GPU port saves ~150 ms of a ~1540 ms path | — | — | Do not build |
 | **Fixed short window @ 250 ms hop** | **Worse:** 7.77× vs shipped 6.25× (F-004/F-009). Cost is `window ÷ hop`; only a larger hop helps, and that is latency. | Measured | Rework only with a larger hop |
-| **Policy: 750 → 500 ms tick, 640 → ~450 ms endpoint** | ~440 ms of perceived latency, ~3× what a GPU port buys | High (F-010) | Two constants + endpoint re-tune |
+| **Policy: 750 → 500 ms tick, 640 → 480 ms endpoint (20 → 15 VAD frames)** | ~285-410 ms of perceived latency, 2-3× what a GPU port buys | High (F-010, arithmetic and frame-quantisation corrected in F-012) | Two constants + endpoint re-tune |
 | **Incremental fbank cache** — keep the window's frames, compute only the ~75 new ones per tick | 1.5–2× frontend CPU, removes 800-FFT bursts | High, ~40 lines in `sensevoice-frontend.js` | Low |
 | **Eliminate the O(n²) decode** — fixed 1.5–2 s window @ 250 ms hop for interim; full window only on final | **Disproved (F-004/F-009)** — at 250 ms hop it costs more than the current loop | Measured | Not worth it at equal hop |
 | **Move fbank + argmax to a dedicated Worker** — VAD, PCM queue and messaging never queue behind a decode | 1.2–1.5× perceived; removes chunk drops under load | High | Moderate |
 
 Combined (original): **10–20× less work per second of audio** → interim latency **1.5–2.5 s → 300–500 ms**, final **2–3 s → 700–900 ms**.
 
-Combined (**measured**): decode is ~10 % of the latency path, so the reachable gain is the policy ~440 ms; the original targets would require cutting tick and endpoint, not model work.
+Combined (**measured**): decode is ~10 % of the latency path, so the reachable gain is the policy ~285-410 ms; the original targets would require cutting tick and endpoint, not model work.
 
-Cheap extras (**status: folded into the 500/450 policy, do not re-do**):
+Cheap extras (**status: folded into the 500/480 policy, do not re-do**):
 
-- `END_SILENCE` 640 → 450 ms — **shipped** (F-012). Going to 400 ms is a further ~50 ms with re-tuned endpoint risk; only pursue it if the A/B shows no commit-contradiction increase.
+- `END_SILENCE` 640 → 480 ms - **shipped** (F-012; the gate is quantised to 32 ms VAD frames, so a literal 450 ms is not expressible). Going to 15 → 13 frames (416 ms) is a further ~64 ms with re-tuned endpoint risk; only pursue it if the A/B shows no commit-contradiction increase.
 - `numThreads`: fixed 4 → `min(8, hardwareConcurrency − 1)` for the WASM fallback — still unmeasured; decode is ~10 % of the path, so expect tens of ms at most.
 
 **WebGPU caution (retained as history, now resolved):** F-010/F-011 measured the WASM penalty at only 2.0–2.7× and showed cost is linear in window length, so a WebGPU port saves ~150 ms of a ~1540 ms path. The lever is closed — do not build it, and do not re-open it without a new measurement that contradicts F-011.
@@ -124,7 +124,7 @@ Without this, every number above is a guess about a specific machine — includi
 ## 6. Roadmap (ordered by value / effort)
 
 1. **Bench harness + baseline numbers** — *done*; see `docs/BENCH_FINDINGS.md` F-001…F-012.
-2. **Policy A/B** — `DECODE_STEP_MS 750 → 500`, `END_SILENCE 640 → ~450 ms`, measured in the live extension via `soundToSubtitleMs` p50/p95 and commit-contradiction rate (~440 ms expected, F-010).
+2. **Policy A/B** — `DECODE_STEP_MS 750 → 500`, `END_SILENCE 20 → 15 frames (640 → 480 ms)`, measured in the live extension via `soundToSubtitleMs` p50/p95 and commit-contradiction rate (~285-410 ms expected, F-012).
 3. **Reference transcripts** — Whisper large-v3 pass over the corpus, then `bench/compare.mjs` → the first quotable CER.
 4. **Asymmetric decode** — greedy interim at the new tick, beam-8 + confidence gate on finals only (+12–21 %, F-008).
 5. **Hotword list UX + trie biasing** — largest perceived-accuracy win on names.

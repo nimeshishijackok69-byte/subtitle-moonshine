@@ -480,37 +480,53 @@ a ratio or a same-sweep table, never a lone millisecond figure.
 
 ---
 
-### F-012 - Shipped policy constants changed from the measured baseline (2026-11-03)
+### F-012 - Shipped policy constants moved from the measured baseline (2026-11-03)
 
-`offscreen.js` now ships `DECODE_STEP_MS = 500` and `END_SILENCE_SAMPLES =
-0.45 s` (was 750 ms / 0.64 s). Nothing above is invalidated: **every measurement
-in F-004 to F-011 was taken at the baseline 750 / 640 policy**, so read those
-tables as describing the pre-change build, not the current one. F-010's
-"~1.54 s end-to-end path" is the baseline arithmetic (750 + 640 + ~150 ms).
+`offscreen.js` now ships `DECODE_STEP_MS = 500` and `END_SILENCE_FRAMES = 15`
+(480 ms); it was 750 ms / 0.64 s. Nothing above is invalidated: **every
+measurement in F-004 to F-011 was taken at the baseline 750 / 640 policy**, so
+read those tables as describing the pre-change build, not the current one.
+F-010's "~1.54 s end-to-end path" is the baseline arithmetic (750 + 640 +
+~150 ms decode).
 
-Why these two numbers, from the measurements already in this file:
+**Correction to F-010's own recommendation.** F-010 suggested
+`END_SILENCE 640 -> 450 ms` for "~190 ms". That assumed a literal 450 ms, but the
+gate is `segmenter.silenceSamples >= END_SILENCE_SAMPLES`, and
+`silenceSamples` advances by `VAD_FRAME_SAMPLES` (512 = 32 ms) per frame, so a
+millisecond value silently rounds **up** to the next 32 ms boundary: 0.45 s
+became 15 frames = 480 ms. (0.64 s happened to be exactly 20 frames, which is why
+the baseline never showed the problem.) The threshold is now expressed in frames,
+and the achievable endpoint gain is **160 ms, not 190 ms**. Anyone deriving a
+timing from a milliseconds constant on that counter will repeat this mistake.
 
-| Change | Gain (expected) | Source |
+Honest gain accounting:
+
+| Change | Gain | Why |
 |---|---|---|
-| tick 750 -> 500 ms | up to 250 ms | F-010: decode is ~10 % of the path; 0.188x realtime leaves ~12x headroom (F-009) |
-| endpoint 640 -> 450 ms | ~190 ms | F-010: 640 ms of endpoint silence is spent per line |
+| tick 750 -> 500 ms | **up to 250 ms**, ~125 ms mean | a displayed line is at most one tick stale, and the wait to the next tick is uniform |
+| endpoint 640 -> 480 ms (20 -> 15 VAD frames) | **160 ms, exact** | fires on the VAD frame that crosses the gate, not on a tick |
+| combined | **~285 ms expected, ~410 ms best case** | both apply per line, but they do not add in every case |
 
-Combined ~440 ms, roughly 3x what a perfect GPU port would buy (F-010), which is
-why the GPU row is CLOSED rather than deferred.
+That is still 2-3x what a perfect GPU port would buy (F-010, ~150 ms), so the GPU
+row stays CLOSED rather than deferred.
 
 Risks to measure, not assume:
 
 - At 500 ms the worst-case 8 s decode (~330 ms browser, F-010) is 66 % of the
   tick, up from 44 %. `pcm.queueDepth` must stay 0 and dropped-audio must stay 0;
   if it does not, the tick is too short for that machine.
+- The final decode goes through `withAsrLock`, and at ~30 % mean duty there is an
+  interim decode in flight when the endpoint fires roughly a third of the time
+  (up to ~330 ms worst case). That queue wait is part of final latency and is
+  more likely now than at 750 ms; it is not part of the 160 ms endpoint gain.
 - A shorter endpoint can split sentences that the 640 ms margin was hiding. The
   VAD only closes below `VAD_CONTINUE_THRESHOLD` (0.35), so a pause inside a
-  sentence still needs ~1.5x the endpoint to split - but the commit-contradiction
-  rate (a `FINAL` rewritten by the next utterance) is the number to watch, not
+  sentence needs a much deeper dip to split - but the commit-contradiction rate
+  (a `FINAL` rewritten by the next utterance) is the number to watch, not
   intuition.
 
-**Status: code changed, browser A/B not yet run.** The expected ~440 ms must not
-be quoted as measured. The A/B compares `soundToSubtitleMs` p50/p95 and the
-commit-contradiction rate from the diagnostics `[timings]` section before
-vs after; browser re-measurement of `asr.inferMs` at 500 ms also closes the
-"is the tick now too short for an 8 s window" question.
+**Status: code changed, browser A/B not yet run.** The expected ~285-410 ms must
+not be quoted as measured. The A/B compares `soundToSubtitleMs` p50/p95 and the
+commit-contradiction rate from the diagnostics `[timings]` section before vs
+after; a browser re-measurement of `asr.inferMs` also closes the "is the tick now
+too short for an 8 s window" question.
