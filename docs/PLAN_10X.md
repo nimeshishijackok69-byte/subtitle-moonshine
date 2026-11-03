@@ -1,30 +1,55 @@
 # Live Japanese Subtitles — 10× Speed & Accuracy Plan
 
-Status: brainstorm / pre-implementation
-Date: 2026-11-02
-Repo: `nimeshishijackok69-byte/subtitle-moonshine` @ `17c5560` (main)
+Status: **partly superseded by measurement** — see `docs/BENCH_FINDINGS.md`
+Date: 2026-11-02 (measured corrections 2026-11-03)
+Repo: `nimeshishijackok69-byte/subtitle-moonshine`
 Product: Chrome MV3 extension, on-device live Japanese ASR for a user-selected tab.
+
+> **Read this before the sections below.** The bench (F-004, F-008, F-009,
+> F-010, F-011, F-012) disproved the central premise of §2 and §6:
+>
+> 1. **Decode speed is not the bottleneck.** In the live extension, decode is
+>    ~150 ms of a ~1540 ms path; the 750 ms tick and 640 ms endpoint are ~90 %
+>    of perceived latency.
+> 2. **The GPU/WebGPU port is closed.** WASM is only 2.0–2.7× native and per-
+>    decode cost is linear in window length — a perfect GPU port would save
+>    ~150 ms, less than two constant changes.
+> 3. **Fixed short windows do not reduce compute.** Cost is `window ÷ hop`;
+>    2 s @ 250 ms measured 7.77× vs the shipped 6.25×. The shipped policy
+>    already has ~12× headroom (0.188× realtime).
+> 4. **The affordable path is policy first, accuracy second:** 500 ms tick +
+>    ~450 ms endpoint (~440 ms), then beam-8 on finals only (+12–21 % on a
+>    decode that fits inside the endpoint silence), then hotword biasing.
+>
+> Sections §2, §3 ("asymmetric decode" conclusion still holds, the GPU wording
+> does not), §4.2, §6 steps 2 and the risk table below are retained as history;
+> where they disagree with the box above, the box wins.
 
 ---
 
-## 1. Where the time goes today (grounded in the code)
+## 1. Where the time goes today (measured baseline)
 
 | Stage | Implementation | Cost profile |
 |---|---|---|
 | Capture | `audio-worklet.js`, resample → 16 kHz Int16, 25 ms chunks | Cheap, not a factor |
 | VAD | Silero v5 on WASM, 512 + 64 samples per 32 ms frame | ~1–2 ms/frame, always-on |
 | Feature extraction | `sensevoice-frontend.js`: 512-pt FFT in **Float64**, per 10 ms frame | Small, but **recomputed for the entire window on every tick** |
-| Inference | SenseVoiceSmall int8, **WASM only**, 4 threads (`ASR_WASM_THREADS`) | Dominant cost |
+| Inference | SenseVoiceSmall int8, **WASM only**, 4 threads (`ASR_WASM_THREADS`) | Dominant compute, but only ~10 % of end-to-end latency (F-010) |
 | Decoding | JS greedy argmax over ~25 k vocab × T frames | ~3–5 ms, minor |
-| Cadence | `DECODE_STEP_MS = 750`, growing window capped at `MAX_UTTERANCE_SAMPLES = 8 s` | **The real structural cost** |
-| Finalize | `END_SILENCE_SAMPLES = 0.64 s` + `TAIL_PAD_SAMPLES = 0.2 s` | Pure added latency |
+| Cadence | `DECODE_STEP_MS`, growing window capped at `MAX_UTTERANCE_SAMPLES = 8 s` | **The real structural cost** |
+| Finalize | `END_SILENCE_SAMPLES` + `TAIL_PAD_SAMPLES = 0.2 s` | Pure added latency |
+
+> The table and numbers in this section describe the **measured baseline**, taken
+> before the policy change: `DECODE_STEP_MS = 750`, `END_SILENCE_SAMPLES = 0.64 s`.
+> Shipped now: **500 ms / 450 ms** (see §2). Every measurement in
+> `docs/BENCH_FINDINGS.md` refers to the baseline values.
 
 ### Two structural facts
 
-1. **The decode is O(n²) over the utterance.** Every 750 ms the entire 0 → 8 s window is re-decoded from scratch. A full 8 s utterance costs ~10 decodes averaging 4.5 s of audio — roughly **5–6× more compute than real time** for no additional information. No KV/conv state reuse.
-2. **The slowest shipped accelerator is used.** `lib/ort.min.js` is the **WebGPU** ORT bundle (the reason the jsep companion had to be restored in `ef871c8`), yet `loadAsr()` hardcodes `executionProviders: ["wasm"]`. The GPU path is present but unused.
+1. **The decode re-reads the whole window.** At the baseline, every 750 ms the entire 0 → 8 s window was re-decoded. Measured cost was 6.25× realtime against 1.00× for a single pass — real, but **not binding**: 0.188× realtime overall, ~12× headroom (F-009).
+2. **The GPU path is present but unused.** `lib/ort.min.js` is the **WebGPU** ORT bundle (the reason the jsep companion had to be restored in `ef871c8`), yet `loadAsr()` hardcodes `executionProviders: ["wasm"]`. F-010/F-011 closed this as a lever — do not wire it up.
 
-Consequence: even with instant inference the experience is bounded at ~1.5–2.5 s, because the 750 ms cadence, 640 ms endpoint and 4-char holdback dominate.
+Consequence: even with instant inference the experience is bounded at ~1.5 s, because the tick, endpoint and 4-char holdback dominate. Cutting the two policy constants to 500 ms / 450 ms is worth ~440 ms; the model is not the constraint.
 
 ---
 
@@ -32,19 +57,23 @@ Consequence: even with instant inference the experience is bounded at ~1.5–2.5
 
 | Lever | Expected gain | Confidence | Cost |
 |---|---|---|---|
-| **WebGPU EP + fp16 model** (int8 WASM as fallback) | 4–10× on `asr.inferMs` | High on Chrome ≥ 121 (Win/macOS); WebGPU unavailable on older macOS | Model conversion + numeric validation; ~470 MB fp16 copy |
+| ~~**WebGPU EP + fp16 model**~~ **CLOSED (F-010/F-011)** — WASM is only 2.0–2.7× native and cost is linear in window length; a perfect GPU port saves ~150 ms of a ~1540 ms path | — | — | Do not build |
+| **Fixed short window @ 250 ms hop** | **Worse:** 7.77× vs shipped 6.25× (F-004/F-009). Cost is `window ÷ hop`; only a larger hop helps, and that is latency. | Measured | Rework only with a larger hop |
+| **Policy: 750 → 500 ms tick, 640 → ~450 ms endpoint** | ~440 ms of perceived latency, ~3× what a GPU port buys | High (F-010) | Two constants + endpoint re-tune |
 | **Incremental fbank cache** — keep the window's frames, compute only the ~75 new ones per tick | 1.5–2× frontend CPU, removes 800-FFT bursts | High, ~40 lines in `sensevoice-frontend.js` | Low |
-| **Eliminate the O(n²) decode** — fixed 1.5–2 s window @ 250 ms hop for interim; full window only on final | 3–5× total compute per second of audio | High; stitch logic already exists (LCP committer) | Moderate: segmenter + committer rework |
+| **Eliminate the O(n²) decode** — fixed 1.5–2 s window @ 250 ms hop for interim; full window only on final | **Disproved (F-004/F-009)** — at 250 ms hop it costs more than the current loop | Measured | Not worth it at equal hop |
 | **Move fbank + argmax to a dedicated Worker** — VAD, PCM queue and messaging never queue behind a decode | 1.2–1.5× perceived; removes chunk drops under load | High | Moderate |
 
-Combined: **10–20× less work per second of audio** → interim latency **1.5–2.5 s → 300–500 ms**, final **2–3 s → 700–900 ms**.
+Combined (original): **10–20× less work per second of audio** → interim latency **1.5–2.5 s → 300–500 ms**, final **2–3 s → 700–900 ms**.
 
-Cheap extras worth another ~300 ms:
+Combined (**measured**): decode is ~10 % of the latency path, so the reachable gain is the policy ~440 ms; the original targets would require cutting tick and endpoint, not model work.
 
-- `END_SILENCE` 640 → ~400 ms (Silero v5 tolerates a tighter endpoint with the current pre-roll logic).
-- `numThreads`: fixed 4 → `min(8, hardwareConcurrency − 1)` for the WASM fallback.
+Cheap extras (**status: folded into the 500/450 policy, do not re-do**):
 
-**Caution:** WebGPU inside an *offscreen document* must be proven experimentally (extension pages are secure contexts, so it should work). Gate it behind a runtime capability probe; the WASM path remains the fallback, not a rewrite.
+- `END_SILENCE` 640 → 450 ms — **shipped** (F-012). Going to 400 ms is a further ~50 ms with re-tuned endpoint risk; only pursue it if the A/B shows no commit-contradiction increase.
+- `numThreads`: fixed 4 → `min(8, hardwareConcurrency − 1)` for the WASM fallback — still unmeasured; decode is ~10 % of the path, so expect tens of ms at most.
+
+**WebGPU caution (retained as history, now resolved):** F-010/F-011 measured the WASM penalty at only 2.0–2.7× and showed cost is linear in window length, so a WebGPU port saves ~150 ms of a ~1540 ms path. The lever is closed — do not build it, and do not re-open it without a new measurement that contradicts F-011.
 
 ---
 
@@ -94,12 +123,12 @@ Without this, every number above is a guess about a specific machine — includi
 
 ## 6. Roadmap (ordered by value / effort)
 
-1. **Bench harness + baseline numbers** (1–2 days) — no product change; makes everything else falsifiable.
-2. **WebGPU + fp16 with WASM fallback + capability probe** (2–4 days) — largest single speed win, low risk.
-3. **Incremental fbank + argmax in a Worker** (1–2 days) — removes jank and chunk drops.
-4. **Asymmetric decode: short-window interim / full-window final + beam search + confidence gate** (3–5 days) — the "faster *and* more accurate" step.
-5. **Hotword list UX + trie biasing** (2–3 days) — largest perceived-accuracy win for real content.
-6. **Then decide:** domain fine-tune vs model swap vs quality pack — only after steps 1–5 have numbers.
+1. **Bench harness + baseline numbers** — *done*; see `docs/BENCH_FINDINGS.md` F-001…F-012.
+2. **Policy A/B** — `DECODE_STEP_MS 750 → 500`, `END_SILENCE 640 → ~450 ms`, measured in the live extension via `soundToSubtitleMs` p50/p95 and commit-contradiction rate (~440 ms expected, F-010).
+3. **Reference transcripts** — Whisper large-v3 pass over the corpus, then `bench/compare.mjs` → the first quotable CER.
+4. **Asymmetric decode** — greedy interim at the new tick, beam-8 + confidence gate on finals only (+12–21 %, F-008).
+5. **Hotword list UX + trie biasing** — largest perceived-accuracy win on names.
+6. **Then decide:** fine-tune vs model swap vs quality pack — only after 3–5 have numbers. Rebuild and verify the store zip before any submission.
 
 ---
 

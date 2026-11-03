@@ -8,7 +8,14 @@ const VAD_CONTEXT_SAMPLES = 64; // Silero v5 reference wrapper carries 64 sample
 const VAD_SPEECH_THRESHOLD = 0.50; // Speech onset threshold
 const VAD_CONTINUE_THRESHOLD = 0.35; // Keeps a decaying tail attached to the utterance
 const VAD_SPEECH_ONSET_FRAMES = 3; // 3 consecutive frames (~96ms) to trigger onset
-const END_SILENCE_SAMPLES = Math.round(0.64 * TARGET_SAMPLE_RATE); // 0.64s silence closes utterance (10,240 samples)
+// Endpoint = pure latency: the final decode cannot start until this much
+// silence is seen, and the user is staring at a stale line meanwhile. 640 ms
+// was a VAD-safety margin measured on the Silero v5 wrapper, not a speech
+// requirement. 450 ms keeps 14 frames of hysteresis at the 32 ms hop (an
+// utterance only closes below VAD_CONTINUE_THRESHOLD, so a pause inside a
+// sentence still needs ~1.5x this to split) while removing ~190 ms from
+// every line. Benchmark F-010 / PLAN_10X §2.
+const END_SILENCE_SAMPLES = Math.round(0.45 * TARGET_SAMPLE_RATE);
 const ANCHOR_PREROLL_SAMPLES = Math.round(0.30 * TARGET_SAMPLE_RATE); // 0.30s anchor preroll (4,800 samples)
 const TAIL_PAD_SAMPLES = Math.round(0.20 * TARGET_SAMPLE_RATE); // 0.20s tail pad (3,200 samples)
 // Decode window floor. The window spans ANCHOR_PREROLL (0.3 s) + speech +
@@ -18,7 +25,12 @@ const TAIL_PAD_SAMPLES = Math.round(0.20 * TARGET_SAMPLE_RATE); // 0.20s tail pa
 // speech, and the CTC encoder needs buffer length, not speech duration.
 const MIN_UTTERANCE_SAMPLES = Math.round(1.0 * TARGET_SAMPLE_RATE);
 const MAX_UTTERANCE_SAMPLES = Math.round(8.0 * TARGET_SAMPLE_RATE); // 8.0s cap per utterance
-const DECODE_STEP_MS = 750; // 750ms progressive anchored decode cadence
+// 500 ms cadence: decode is ~10% of the latency path (browser: ~150 ms mean,
+// 329 ms max at 4 WASM threads, F-010), and the shipped 750 ms tick was the
+// single largest avoidable delay. At 500 ms the worst-case 8 s decode (~330 ms)
+// is 66% of the tick, and total duty stays ~30% (F-009 headroom), so this buys
+// up to 250 ms of perceived latency without dropping a PCM chunk.
+const DECODE_STEP_MS = 500;
 const HOLDBACK_CHARS = 4; // 4 characters holdback for local agreement
 const ASR_STOP_TIMEOUT_MS = 2000; // upper bound on awaiting a decode during stop
 const RING_BUFFER_SECONDS = 20;

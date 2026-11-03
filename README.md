@@ -48,9 +48,9 @@ popup → service worker → offscreen document → AudioWorklet → 16 kHz PCM
 
 - **Offscreen document** owns `getDisplayMedia` and the Web Audio graph, which an MV3 service worker can't hold.
 - **AudioWorklet** averages channels to mono, applies a 4th-order Butterworth low-pass at 7.5 kHz (skipped when the source is already ≤16 kHz), resamples by streaming linear interpolation, and posts 25 ms Int16 chunks as transferables.
-- **Silero VAD** runs on 512-sample frames fed with the preceding 64 samples of context (the v5 wrapper relies on it). Onset needs 3 frames above `0.50`; an utterance closes after 640 ms below `0.35`. Windows are anchored at 300 ms pre-roll, padded 200 ms, floored at 1.0 s and capped at 8 s.
+- **Silero VAD** runs on 512-sample frames fed with the preceding 64 samples of context (the v5 wrapper relies on it). Onset needs 3 frames above `0.50`; an utterance closes after 450 ms below `0.35`. Windows are anchored at 300 ms pre-roll, padded 200 ms, floored at 1.0 s and capped at 8 s.
 - **SenseVoice** runs a JS fbank frontend (80 bins, LFR 7/6, CMVN) and greedy CTC decode with `language=ja`, `text_norm` on. Output is NFKC-normalised, tags stripped, and Japanese inter-character spaces removed.
-- **Committer** re-decodes the anchored window every 750 ms while speech continues, commits only the longest common prefix minus a 4-character holdback, and rewrites one line per utterance (`GROW` / `REVISE` / `INTERIM` / `FINAL`). Every decode is serialised through one promise chain so a late tick can't overwrite a finished line.
+- **Committer** re-decodes the anchored window every 500 ms while speech continues, commits only the longest common prefix minus a 4-character holdback, and rewrites one line per utterance (`GROW` / `REVISE` / `INTERIM` / `FINAL`). Every decode is serialised through one promise chain so a late tick can't overwrite a finished line.
 - **Backpressure** caps the PCM queue at 20 chunks (~0.5 s). If VAD falls behind realtime the oldest queued chunk is dropped, because stale audio cannot reduce lag by being decoded later; the dropped duration is charged into the latency telemetry so `audioLagMs` stays truthful.
 - **Service worker** relays messages, re-injects the overlay when a tab finishes navigating, and schedules offscreen teardown 5 minutes after the session goes idle. That timer is a `setTimeout`, which does not survive service-worker termination (~30 s idle), so the document can outlive the intended window — a known gap, not a guarantee.
 
@@ -92,7 +92,7 @@ It reports ASR time, end-to-end latency, audio backlog, and sound-to-subtitle de
 
 ## Known limitations
 
-- First subtitle for an utterance lands roughly 2 s after speech begins.
+- First subtitle for an utterance is expected to land roughly 1.2 s after speech begins (onset confirmation + one 500 ms tick + decode + holdback); it measured ~2 s at the old 750 ms tick. The browser A/B for this change is pending — do not quote the 1.2 s figure as measured.
 - The 8 s cap can cut a long continuous sentence.
 - A misrecognition that survives prefix agreement stays on screen until the utterance ends.
 - Short interjections (`あ。`, `はい。`) are the main hallucination residue.

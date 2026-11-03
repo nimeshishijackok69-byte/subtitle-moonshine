@@ -151,9 +151,13 @@ offscreen.asr.inferMs <=4s   n=20 last=228.1ms mean=231.7ms max=268.4ms
 ```
 
 Count, last, mean, max per instrumented call site. The mean is not the useful
-number - `max` is. A mean of 210 ms with a max of 380 ms against a 750 ms step
+number - `max` is. A mean of 210 ms with a max of 380 ms against a 500 ms step
 is healthy; a mean of 210 ms with a max of 2400 ms is a machine that will drop
 audio, and the mean hides it.
+
+The step moved from 750 ms to 500 ms (see `docs/PLAN_10X.md` §2), so re-read
+`max` against 500 ms: a decode above ~500 ms now makes the effective interim
+cadence slip instead of merely eating headroom.
 
 The window buckets exist because window size dominates cost and moves with the
 content: two sessions on the same machine, same model, same policy differed by

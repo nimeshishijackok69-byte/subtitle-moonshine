@@ -477,3 +477,40 @@ Measurement caveat: absolute values drift 25-50 % between sweeps on this machine
 (`fixed2s750` run-only came back at 56.3 / 71.7 / 85.3 ms across three sessions).
 Ratios within a sweep are stable; cross-sweep absolute comparisons are not. Quote
 a ratio or a same-sweep table, never a lone millisecond figure.
+
+---
+
+### F-012 - Shipped policy constants changed from the measured baseline (2026-11-03)
+
+`offscreen.js` now ships `DECODE_STEP_MS = 500` and `END_SILENCE_SAMPLES =
+0.45 s` (was 750 ms / 0.64 s). Nothing above is invalidated: **every measurement
+in F-004 to F-011 was taken at the baseline 750 / 640 policy**, so read those
+tables as describing the pre-change build, not the current one. F-010's
+"~1.54 s end-to-end path" is the baseline arithmetic (750 + 640 + ~150 ms).
+
+Why these two numbers, from the measurements already in this file:
+
+| Change | Gain (expected) | Source |
+|---|---|---|
+| tick 750 -> 500 ms | up to 250 ms | F-010: decode is ~10 % of the path; 0.188x realtime leaves ~12x headroom (F-009) |
+| endpoint 640 -> 450 ms | ~190 ms | F-010: 640 ms of endpoint silence is spent per line |
+
+Combined ~440 ms, roughly 3x what a perfect GPU port would buy (F-010), which is
+why the GPU row is CLOSED rather than deferred.
+
+Risks to measure, not assume:
+
+- At 500 ms the worst-case 8 s decode (~330 ms browser, F-010) is 66 % of the
+  tick, up from 44 %. `pcm.queueDepth` must stay 0 and dropped-audio must stay 0;
+  if it does not, the tick is too short for that machine.
+- A shorter endpoint can split sentences that the 640 ms margin was hiding. The
+  VAD only closes below `VAD_CONTINUE_THRESHOLD` (0.35), so a pause inside a
+  sentence still needs ~1.5x the endpoint to split - but the commit-contradiction
+  rate (a `FINAL` rewritten by the next utterance) is the number to watch, not
+  intuition.
+
+**Status: code changed, browser A/B not yet run.** The expected ~440 ms must not
+be quoted as measured. The A/B compares `soundToSubtitleMs` p50/p95 and the
+commit-contradiction rate from the diagnostics `[timings]` section before
+vs after; browser re-measurement of `asr.inferMs` at 500 ms also closes the
+"is the tick now too short for an 8 s window" question.
