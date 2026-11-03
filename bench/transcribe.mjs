@@ -11,6 +11,7 @@ import { writeFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { Asr, loadPcm, SAMPLE_RATE } from "./lib/asr.mjs";
 import { getJobs, transcriptFor } from "./lib/strategies.mjs";
+import { exitEvidence, exitNow } from "./lib/exit.mjs";
 
 function arg(name, fallback) {
   const i = process.argv.indexOf(`--${name}`);
@@ -59,3 +60,14 @@ mkdirSync(path.dirname(outPath), { recursive: true });
 writeFileSync(outPath, text + "\n");
 console.log(`\n${outPath}: ${strategy} beam=${beamWidth} ${jobs.length} decodes, ${text.length} chars, ${wall.toFixed(1)}s wall, ` +
   `${(wall / (pcm.length / SAMPLE_RATE)).toFixed(3)} RTF`);
+
+// The transcript is on disk, so nothing below can change the result. ORT's
+// native teardown can still leave the event loop non-empty after the last
+// decode (F-007); without this a finished run sits at 0 % CPU indefinitely and
+// looks exactly like a hang. Release is best-effort, then exit regardless.
+const exit = exitEvidence();
+if (exit.activeResources.length > 0) {
+  console.log(`still holding the loop at exit: ${exit.activeResources.join(", ")}`);
+}
+await asr.dispose();
+await exitNow(0);
