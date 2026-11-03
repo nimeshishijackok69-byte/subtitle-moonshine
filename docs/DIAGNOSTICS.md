@@ -137,6 +137,11 @@ times, thread count, decode cadence, PCM counters, VAD counters.
 The two that settle most arguments:
 
 - `engine.threads` — 1 vs 4 explains a 3× speed difference.
+- `engine.firstTickDelayMs` — how long `scheduleFirstTick` waited before the
+  first decode of the current utterance. It is computed from the ring as
+  `anchor + MIN_UTTERANCE − now`, so ~600 ms is normal; a value near 0 means the
+  utterance opened with the minimum window already behind it, and a value near
+  the cadence (500 ms) means the anchor was created late.
 - `vad.speechFrames` / `vad.idleFrames` — if `speechFrames` is 0 while audio is
   playing, the VAD input contract is wrong, and no amount of ASR tuning will
   help. That is exactly the shape of the bug that made the interim line never

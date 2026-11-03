@@ -530,3 +530,65 @@ not be quoted as measured. The A/B compares `soundToSubtitleMs` p50/p95 and the
 commit-contradiction rate from the diagnostics `[timings]` section before vs
 after; a browser re-measurement of `asr.inferMs` also closes the "is the tick now
 too short for an 8 s window" question.
+
+
+---
+
+### F-013 - A shorter tick needs an exact first tick, and the 500 ms step is priced at +29 % wall (2026-11-03)
+
+Follow-up to F-012, same day. Two results: the cadence change's measured cost,
+and a first-subtitle regression it introduced that the harness could not see.
+
+**The price, measured.** Same clip, 4 threads, greedy, hop-only difference:
+
+| Policy | decodes / 60 s | wall | bench duty | `p50RunMs` | `p95RunMs` |
+|---|---|---|---|---|---|
+| 750 ms hop (baseline) | 82 | 11.7 s | 19.5 % | 128.4 ms | 224.8 ms |
+| 500 ms hop (shipped) | 112 | 15.1 s | 25.2 % | 121.2 ms | 222.3 ms |
+
++37 % decodes, +29 % wall, and `p50` does not rise, because the added decodes are
+the short windows at the start of each utterance rather than more 8 s windows.
+`computeOverRealtime` moves 6.25x -> 8.17x by the same arithmetic. Bench duty is
+not browser duty: the bench decodes continuously, while the extension decodes only
+during speech (F-010 measured 12.9 % at the 750 ms tick, 0.84 decodes per audio
+second against 1.37 here), so ~30 % remains the right browser estimate after this
+change.
+
+The cadence cost is therefore affordable. What is not affordable is the tail: an
+8 s window is 66 % of a 500 ms tick at the native p50, but **131 %** of it at the
+browser max measured in F-010 (655.6 ms). On those decodes the tick is now skipped
+and the effective interim cadence slips to 1000 ms, exactly on the longest
+sentences. That is the observable price of the change and the next `<=8s` bucket
+settles how often it happens.
+
+**The regression the change introduced.** The decode timer used to be
+`setInterval(…, DECODE_STEP_MS)` started at utterance creation, so the first
+decode waited for the first grid boundary that happened to have a long enough
+window. The anchor starts `ANCHOR_PREROLL` (300 ms) before the first of the three
+onset frames (~96 ms), so a freshly created utterance already owns ~396 ms of
+window:
+
+| First-tick policy | Window at first tick | Short enough? | First decode lands at |
+|---|---|---|---|
+| 750 ms grid (baseline) | ~1146 ms | yes | 750 ms |
+| 500 ms grid (as shipped in F-012) | ~896 ms | no - 1.0 s minimum | 1000 ms |
+| exact: `anchor + MIN_UTTERANCE - ring.total` | ~1000 ms | yes | ~604 ms |
+
+So the 500 ms tick, meant to remove up to 250 ms, would have made the *first*
+subtitle 250 ms later than the baseline it replaced. The browser report in F-010
+confirms the 750 ms case from the other direction: its last decode carried
+`asr.frames 19` ~= 1.14 s, the signature of a first tick at 750 ms rather than a
+1.5 s second tick.
+
+`scheduleFirstTick()` now derives the delay from the ring, so the first decode
+happens the instant the minimum window exists for any preroll, minimum or cadence.
+The steady state stays on a fixed grid deliberately: re-anchoring each tick on
+completion would push every decode later by however long the previous one took.
+`engine.firstTickDelayMs` reports the computed delay (~600 ms expected) and the
+first decode's window should read ~17 frames instead of ~19.
+
+General lesson, which is why this is in the findings file: a cadence constant and
+a *minimum* window constant interact, and rounding the first event up to the grid
+is only harmless while the hop happens to be long enough. Any future
+`DECODE_STEP_MS`, `MIN_UTTERANCE_SAMPLES` or `ANCHOR_PREROLL_SAMPLES` change is
+safe only because the first tick is no longer on the grid.

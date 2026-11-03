@@ -309,6 +309,52 @@ function telemetryFor(current, audioSamples, captureEpoch, asrDurationMs) {
   };
 }
 
+// The first decode must fire the moment MIN_UTTERANCE of audio exists under the
+// anchor, not at the next multiple of the cadence. The anchor starts
+// ANCHOR_PREROLL (300 ms) before the first of the three onset frames, so a
+// window is already ~396 ms old when the utterance is created: at the old
+// 750 ms step the first tick found ~1146 ms and decoded, but the shipped 500 ms
+// step finds ~896 ms, returns (MIN_UTTERANCE is 1000 ms), and the first text
+// slips to the 1000 ms tick - a 250 ms regression on the one number a viewer
+// notices first. Deriving the delay from the ring makes the first tick exact for
+// any preroll, minimum or cadence; only the steady state stays on a fixed grid,
+// because a re-anchoring timer would push every decode later by however long the
+// previous one took.
+function scheduleFirstTick(current) {
+  const u = current.utterance;
+  const scheduledAt = performance.now();
+  const minimum = () => u.anchorStart + MIN_UTTERANCE_SAMPLES - current.ring.total;
+
+  const waitForMinimum = () => {
+    // finishUtterance may have closed or replaced the line while waiting.
+    if (u.closed || current.utterance !== u) return;
+    const shortfall = minimum();
+    if (shortfall > 0) {
+      // The ring advances with captured audio, not with wall time, so a decode
+      // still holding the PCM queue can leave the window short even after the
+      // computed delay. Re-arm for the remaining audio instead of falling back
+      // to the steady-state grid, which would cost a whole tick.
+      const waitMs = Math.max(1, Math.ceil((shortfall / TARGET_SAMPLE_RATE) * 1000));
+      u.timer = setTimeout(waitForMinimum, waitMs);
+      return;
+    }
+    DIAG.set("engine.firstTickDelayMs", Math.round(performance.now() - scheduledAt));
+    u.timer = setInterval(() => tickAnchoredUtterance(current), DECODE_STEP_MS);
+    tickAnchoredUtterance(current);
+  };
+
+  u.timer = setTimeout(waitForMinimum, Math.max(0, Math.round((minimum() / TARGET_SAMPLE_RATE) * 1000)));
+}
+
+// clearInterval and clearTimeout share one handle pool in the platform, but the
+// handle here is whichever of the two scheduled it, so say both.
+function clearDecodeTimer(u) {
+  if (!u?.timer) return;
+  clearTimeout(u.timer);
+  clearInterval(u.timer);
+  u.timer = null;
+}
+
 async function tickAnchoredUtterance(current) {
   const u = current.utterance;
   if (!u || u.isDecoding || u.closed || !asrLoaded || session !== current || intentionalStop || current.stopping) return;
@@ -398,7 +444,7 @@ async function finishUtterance(current, endAbs) {
   resetVadState();
 
   if (u) u.closed = true;
-  if (u?.timer) { clearInterval(u.timer); u.timer = null; }
+  clearDecodeTimer(u);
   current.utterance = null;
 
   if (!u) return;
@@ -488,7 +534,7 @@ function handleVadFrame(current, probability, frameStart, frameEnd) {
           closed: false,
           timer: null
         };
-        current.utterance.timer = setInterval(() => tickAnchoredUtterance(current), DECODE_STEP_MS);
+        scheduleFirstTick(current);
       }
     } else {
       segmenter.speechRun = 0;
@@ -631,7 +677,7 @@ async function forwardTranscript(tabId, event) {
 
 // ─── Session lifecycle ──────────────────────────────────────────────
 async function disposeSessionResources(cur) {
-  if (cur.utterance?.timer) { clearInterval(cur.utterance.timer); cur.utterance.timer = null; }
+  clearDecodeTimer(cur.utterance);
   try { cur.workletNode?.port?.close(); cur.sourceNode?.disconnect();
     cur.workletNode?.disconnect(); cur.silenceNode?.disconnect(); } catch{}
   try { if(cur.audioContext?.state!=="closed") await cur.audioContext.close(); } catch{}

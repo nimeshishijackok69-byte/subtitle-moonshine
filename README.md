@@ -92,7 +92,7 @@ It reports ASR time, end-to-end latency, audio backlog, and sound-to-subtitle de
 
 ## Known limitations
 
-- First subtitle for an utterance is expected to arrive up to one tick sooner, so ~1.75 s instead of the measured ~2 s; the browser A/B for the 500 ms tick is pending, so do not quote either figure as re-measured.
+- First subtitle for an utterance is timed by `scheduleFirstTick`, which targets the instant the 1.0 s minimum window exists under the anchor (~604 ms after the utterance opens) rather than the next cadence boundary. At 500 ms a grid-only timer would have waited 1000 ms, and at 750 ms it waited 750 ms, so the exact scheduler is what makes the shorter tick a gain. Measured end-to-end figures for the 500 ms A/B are still pending.
 - The 8 s cap can cut a long continuous sentence.
 - A misrecognition that survives prefix agreement stays on screen until the utterance ends.
 - Short interjections (`あ。`, `はい。`) are the main hallucination residue.

@@ -11,6 +11,11 @@ const s = (sec) => Math.round(sec * SAMPLE_RATE);
 // to be compared against.
 const FIXED = /^fixed(\d+(?:\.\d+)?)s(\d+)$/;
 const ALIASES = { fixed1s5_250: "fixed1.5s250" };
+// Growing-anchor policy: `current` is the shipped cadence, `current750` the same
+// policy at an older hop. Kept parseable so a policy change can be priced
+// against the one before it without editing the harness.
+const CURRENT = /^current(?:(\d+))?$/;
+const SHIPPED_HOP_MS = 500;
 
 export function getJobs(strategy, totalSamples) {
   const jobs = [];
@@ -18,23 +23,11 @@ export function getJobs(strategy, totalSamples) {
   if (fixedMatch) {
     return fixed(totalSamples, Number(fixedMatch[1]), Number(fixedMatch[2]) / 1000);
   }
+  const currentMatch = CURRENT.exec(strategy);
+  if (currentMatch) {
+    return current(totalSamples, Number(currentMatch[1] || SHIPPED_HOP_MS) / 1000);
+  }
   switch (strategy) {
-    // Current extension behaviour: an utterance anchor grows to an 8 s cap,
-    // decoded every 750 ms (first decode once MIN_UTTERANCE = 1 s is available).
-    case "current": {
-      let seg = 0;
-      for (let segStart = 0; segStart < totalSamples; segStart += s(8), seg++) {
-        const segEnd = Math.min(segStart + s(8), totalSamples);
-        for (let t = s(1); ; t += s(0.75)) {
-          const start = segStart;
-          const end = Math.min(segStart + t, segEnd);
-          if (end <= start) break;
-          jobs.push({ start, end, label: "current", seg });
-          if (start + t >= segEnd) break;
-        }
-      }
-      return jobs;
-    }
     // One decode per 8 s chunk: the floor for compute (accuracy reference).
     case "final8": {
       for (let start = 0; start < totalSamples; start += s(8)) {
@@ -44,6 +37,26 @@ export function getJobs(strategy, totalSamples) {
     }
     default: throw new Error(`unknown strategy: ${strategy}`);
   }
+}
+
+// The shipped pipeline: an utterance anchor grows to an 8 s cap, decoded every
+// `hopSec` once MIN_UTTERANCE = 1 s of window is available. The first decode is
+// scheduled by the extension at the instant the minimum window exists, which is
+// why this starts at 1 s rather than at the first hop boundary.
+function current(totalSamples, hopSec) {
+  const jobs = [];
+  let seg = 0;
+  for (let segStart = 0; segStart < totalSamples; segStart += s(8), seg++) {
+    const segEnd = Math.min(segStart + s(8), totalSamples);
+    for (let t = s(1); ; t += s(hopSec)) {
+      const start = segStart;
+      const end = Math.min(segStart + t, segEnd);
+      if (end <= start) break;
+      jobs.push({ start, end, label: `current${Math.round(hopSec * 1000)}`, seg });
+      if (start + t >= segEnd) break;
+    }
+  }
+  return jobs;
 }
 
 function fixed(totalSamples, windowSec, hopSec) {
@@ -74,7 +87,7 @@ export function stitch(texts) {
 // Growing-window decodes repeat the whole utterance on every tick; concatenating
 // them multiplies the transcript. Take the last (longest) decode per segment.
 export function transcriptFor(strategy, jobs, texts) {
-  if (strategy !== "current") {
+  if (!CURRENT.test(strategy)) {
     return strategy.startsWith("fixed") ? stitch(texts) : texts.join(" ");
   }
   const lastPerSeg = new Map();
