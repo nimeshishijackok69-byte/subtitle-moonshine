@@ -380,15 +380,24 @@ Against the native run-only numbers from F-009:
 | ~1.5–2 s | 56.3 ms | 136–153 ms | 2.4–2.7× |
 | 8 s (assumed to be the 328.9 ms max) | 167.0 ms | 328.9 ms | 2.0× |
 
-So the WASM penalty on this machine is **~2.0–2.7×**, not the 3–6× the plan
-budgeted for. Decode is **10 % of the ~1.54 s end-to-end path** (750 ms tick +
-640 ms endpoint + 153 ms decode), with 4.9× headroom at the mean and 2.3× on the
-worst single decode.
+So the WASM penalty on this machine is **~2.0–2.7× at matched window sizes**, not
+the 3–6× the plan budgeted for. The session mean is a mixture of window sizes, so
+the ratio only means anything row by row (F-011 corrects the 8 s row to ~2.5×); a
+session mean set against one fixed window would be an apples-to-oranges figure,
+and F-011's per-window buckets exist so that comparison is never made by accident.
+
+Correcting the latency accounting: **the tick and the endpoint are not serial.**
+An interim appears at (wait to the next tick) + decode ≈ 500–900 ms; a FINAL
+appears at (endpoint silence) + decode ≈ 640 + 150 ms. There is no single
+"1.54 s path" covering both — adding the two constants describes only a final
+that happens to fire one tick after the last interim. Decode is therefore
+**~20–25 % of the interim path and ~19 % of the final path**: the minority in
+both, which is the claim that actually matters here.
 
 Consequences, and they reorder the roadmap a second time:
 
-- **A GPU port cannot buy visible latency here.** Perfect inference on the
-  current policy removes ~153 ms of ~1540 ms. The tick and the endpoint dominate.
+- **A GPU port cannot buy visible latency here.** Perfect inference removes
+  ~150 ms from either path; the tick and the endpoint dominate both.
 - **Accuracy is affordable now.** Beam-8 costs +11 ms native (F-008) → ~+27 ms in
   WASM, paid against 640 ms of endpoint silence that is already being spent.
   Hotword biasing and a beam-8 final belong before any backend change.
@@ -555,11 +564,11 @@ second against 1.37 here), so ~30 % remains the right browser estimate after thi
 change.
 
 The cadence cost is therefore affordable. What is not affordable is the tail: an
-8 s window is 66 % of a 500 ms tick at the native p50, but **131 %** of it at the
-browser max measured in F-010 (655.6 ms). On those decodes the tick is now skipped
-and the effective interim cadence slips to 1000 ms, exactly on the longest
-sentences. That is the observable price of the change and the next `<=8s` bucket
-settles how often it happens.
+8 s window is 48–55 % of a 500 ms tick at the native p50 (242–276 ms, F-011), but
+**131 %** of it at the browser max measured in F-010 (655.6 ms). On those decodes
+the tick is now skipped and the effective interim cadence slips to 1000 ms,
+exactly on the longest sentences. That is the observable price of the change and
+the next `<=8s` bucket settles how often it happens.
 
 **The regression the change introduced.** The decode timer used to be
 `setInterval(…, DECODE_STEP_MS)` started at utterance creation, so the first
@@ -592,3 +601,61 @@ a *minimum* window constant interact, and rounding the first event up to the gri
 is only harmless while the hop happens to be long enough. Any future
 `DECODE_STEP_MS`, `MIN_UTTERANCE_SAMPLES` or `ANCHOR_PREROLL_SAMPLES` change is
 safe only because the first tick is no longer on the grid.
+
+### F-014 — The first CER, and why beam cannot be decided with it (2026-11-03)
+
+First correctness numbers. Reference is Whisper large-v3 int8 CPU
+(`bench/ref-whisper.py`), hypothesis is the bench's own SenseVoiceSmall at
+`final8` (8 s non-overlapping windows, the accuracy floor of the pipeline), both
+over the same slice. Character-only CER is the comparable column; punctuation
+matters because SenseVoice punctuates heavily.
+
+| Slice | Hypothesis | Ref chars | Hyp chars | CER (char) | CER (punct) | Errors |
+|---|---|---|---|---|---|---|
+| 30–180 s | greedy | 465 | 425 | **24.73 %** | 28.51 % | 115 |
+| 30–180 s | beam-8 | 465 | 423 | **25.59 %** | 29.57 % | 119 |
+| 600–750 s | greedy | 628 | 591 | **12.90 %** | 16.03 % | 81 |
+| 600–750 s | beam-8 | 628 | 592 | **12.58 %** | 15.71 % | 79 |
+
+**Beam-8 is not decided.** It loses 4 errors on one slice and wins 2 on the other
+— 0.3–0.9 points on 500–650-character references. The sign flips, so neither
+slice refutes the other; the earlier F-008 reasoning (beam costs 12–21 % more
+time) stands on its own, but there is no accuracy evidence to pay it for.
+
+**The instrument is currently too noisy to settle it, which is the real result.**
+The same 600–750 s audio through a second checkpoint, kotoba-whisper v2.0,
+disagrees with large-v3 about how much was said at all:
+
+| Reference | Segments | Chars | Speech covered |
+|---|---|---|---|
+| large-v3 | 40 | 630 | 153.9 s |
+| kotoba v2.0 | 34 | 503 | 104.4 s |
+
+Scoring the identical hypothesis against kotoba gives **34.79 %** char CER instead
+of 12.90 %. A 20 % reference-to-reference disagreement is ~40× the beam effect
+being measured, so no hypothesis ranking from these two rows is meaningful.
+Kotoba's omitted spans start on 30 s boundaries (13.2→30.0, 56.6→60.0,
+83.7→90.0, 113.3→120.0 s), the signature of whole Whisper windows being classified
+as no-speech; whether those windows are music, action, or quiet dialogue is not
+yet established. Until it is, `regions.json` is a precondition for quoting any CER
+here — not a refinement of it.
+
+**One reference row is contaminated and must be trimmed.** large-v3 ends the
+600–750 s slice with a segment at 143.4–173.3 s reading
+`ご視聴ありがとうございました` — the ED music, the same stock hallucination as the
+OP in F-013's 0–30 s, and it overruns the 150 s slice by 23 s. Score 600–740 s,
+not 600–750 s, once `regions.json` exists.
+
+**The two slices are not directly comparable either.** 30–180 s carries
+3.1 chars/s of speech against 4.2 chars/s for 600–750 s, and the 30–180 s
+hypothesis drops the first ~3.4 s of dialogue outright (its text begins at
+`あの3人は助かったのか`, which the reference places at 33.4 s). A 12-point gap
+between slices is therefore unexplained variance in the reference, the slice, or
+the pipeline — not yet an accuracy trend.
+
+Operational note, same root as F-007: `bench/transcribe.mjs` did not release the
+ORT session, so a run that finished writing its transcript at 19:55:10 then sat
+at 0 % CPU with one thread for 31 minutes and looked like a decode deadlock. It
+now reports whatever still holds the event loop, disposes the session, and exits
+through `exitNow()` like `run.mjs`. The transcript was complete on disk the whole
+time; nothing was lost.
