@@ -659,3 +659,61 @@ at 0 % CPU with one thread for 31 minutes and looked like a decode deadlock. It
 now reports whatever still holds the event loop, disposes the session, and exits
 through `exitNow()` like `run.mjs`. The transcript was complete on disk the whole
 time; nothing was lost.
+
+### F-015 - On a 4-core machine the decoder is saturated, so the tick stops mattering (2026-11-03)
+
+One live session on a different machine from F-010, captured from the popup
+diagnostic report. This is the first hardware where decode clearly *is* the
+bottleneck, and it inverts the F-013 duty estimate.
+
+| | F-010 machine | This machine |
+|---|---|---|
+| `hardwareConcurrency` | 12 | **4** |
+| `asr.inferMs` mean / max | 153.4 / 328.9 ms | **1028.5 / 3773.2 ms** |
+| `asr.loadMs` | 1452 ms | 6505 ms |
+| `vad.loadMs` | 310 ms | 1588 ms |
+| `pcm.queueDepth` | 0 | 0 |
+
+Per-window buckets, browser: `<=2s` 550 ms mean, `<=4s` 990 ms, `<=6s` 1572 ms,
+`<=8s` **2121 ms mean / 3773 ms max**. Against F-011's native `p50` of 72-276 ms
+that is a 6-7x browser penalty, not the 2.0-2.7x measured on the 12-core box, so
+the WASM ratio in F-010 is a property of that machine, not of the runtime.
+
+**The decisive arithmetic.** The session reported 39 723 chunks (993.1 s of
+audio), 297 decodes at 1028.5 ms mean, and 7 946 speech frames of 32 ms
+(254.3 s of speech):
+
+- decode time 305.5 s over 993.1 s of captured audio = **30.8 % duty** - the same
+  number F-010 and F-013 quote, which is why duty alone hid this.
+- decode time 305.5 s over **254.3 s of speech = 120 %**. The decoder spends more
+  time decoding than there is speech to decode.
+
+Above 100 % the machine cannot keep up during dialogue. `tickAnchoredUtterance`
+returns early when `u.isDecoding`, so the skipped ticks cost nothing and are not
+queued - the effective interim cadence becomes *the decode time*, whatever
+`DECODE_STEP_MS` says. On this hardware 500 ms, 750 ms and 1000 ms are
+indistinguishable in output; only the endpoint constant still moves latency
+(160 ms, F-012).
+
+**Consequence: cadence is a fast-machine lever.** F-009/F-013 priced it on a
+machine with ~12x headroom and concluded it was affordable - still true there.
+On a machine of this class the same change is free but useless, and the levers
+are decode cost instead: window cap (`<=8s` at 2.1 s mean is 4.2x a 500 ms tick),
+thread count (4 WASM threads on 4 logical cores while a video decoder is also
+running), or a smaller model. Any future policy claim must name the core count,
+because "decode is 10 % of the path" (F-010) and "the decoder is saturated"
+(this) are both true - on different laptops.
+
+**Also observed, unfixed:** when the endpoint fires while an interim decode is in
+flight, `finishUtterance` queues its FINAL behind that interim through
+`withAsrLock`, and the interim's result is then discarded (`u.closed`). On a fast
+machine that wastes ~150 ms of final latency; here it wastes ~1000 ms, doubling
+the wait for the line the user is actually reading. Candidate fix: skip a tick
+when `segmenter.silenceSamples` already indicates the utterance is about to
+close, so the endpoint never queues behind a doomed decode.
+
+Caveats: one session, one machine, user-reported telemetry, and the two capture
+runs in it are summed. The >100 % figure does not depend on that summation
+because both terms are computed from the same counters. The build also predates
+`scheduleFirstTick` (F-013), so its first-subtitle latency carries that
+regression and must not be used as the new baseline.
