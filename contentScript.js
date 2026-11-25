@@ -57,9 +57,36 @@
     interimTail: "",
     finalizedLineId: null,
     dismissed: false,
-    pendingRender: false
+    pendingRender: false,
+    controlsHideTimer: null,
+    lockedWidth: 0
   };
   globalThis[STATE_KEY] = state;
+
+  function loadSavedPosition() {
+    try {
+      chrome.storage?.local?.get("overlay.position", (res) => {
+        if (res && res["overlay.position"] && !state.position) {
+          state.position = res["overlay.position"];
+          applyPosition();
+        }
+      });
+    } catch {
+      // Ignore storage errors in restricted contexts or unit shims.
+    }
+  }
+
+  function savePosition(pos) {
+    try {
+      if (pos) {
+        chrome.storage?.local?.set({ "overlay.position": pos });
+      } else {
+        chrome.storage?.local?.remove("overlay.position");
+      }
+    } catch {
+      // Ignore storage errors in restricted contexts or unit shims.
+    }
+  }
 
   function getMountParent() {
     return document.fullscreenElement || document.webkitFullscreenElement || document.body || document.documentElement;
@@ -126,24 +153,29 @@
 
       #${ROOT_ID} .dg-toolbar {
         position: absolute;
-        top: -32px;
+        top: -36px;
         right: 0;
-        display: none;
+        display: flex;
         gap: 6px;
-        pointer-events: auto;
-        padding-bottom: 10px;
+        pointer-events: none;
+        opacity: 0;
+        visibility: hidden;
+        padding-bottom: 14px;
+        transition: opacity 120ms ease;
       }
 
       #${ROOT_ID}.dg-toolbar-bottom .dg-toolbar {
         top: auto;
-        bottom: -32px;
+        bottom: -36px;
         padding-bottom: 0;
-        padding-top: 10px;
+        padding-top: 14px;
       }
 
-      #${ROOT_ID}:hover .dg-toolbar,
+      #${ROOT_ID}.dg-controls-open .dg-toolbar,
       #${ROOT_ID}.dg-dragging .dg-toolbar {
-        display: flex;
+        opacity: 1;
+        visibility: visible;
+        pointer-events: auto;
       }
 
       #${ROOT_ID} .dg-tool-button {
@@ -152,26 +184,31 @@
         display: inline-flex;
         align-items: center;
         justify-content: center;
-        border-radius: 4px;
-        border: 1px solid rgba(255, 255, 255, 0.18);
-        background: rgba(15, 18, 20, 0.85);
+        gap: 4px;
+        border-radius: 5px;
+        border: 1px solid rgba(255, 255, 255, 0.24);
+        background: rgba(15, 18, 20, 0.92);
         color: #ffffff;
         font-family: system-ui, -apple-system, sans-serif;
         font-size: 12px;
+        font-weight: 500;
         line-height: 1;
-        padding: 5px 8px;
+        padding: 6px 10px;
         text-shadow: none;
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);
         cursor: pointer;
         user-select: none;
+        white-space: nowrap;
       }
 
       #${ROOT_ID} .dg-tool-button:hover {
-        background: rgba(35, 42, 48, 0.95);
-        border-color: rgba(255, 255, 255, 0.4);
+        background: rgba(35, 42, 48, 0.98);
+        border-color: rgba(255, 255, 255, 0.5);
       }
 
       #${ROOT_ID} .dg-drag-handle {
         cursor: grab;
+        touch-action: none;
       }
 
       #${ROOT_ID}.dg-dragging .dg-drag-handle {
@@ -187,6 +224,7 @@
       #${ROOT_ID} .dg-final-line {
         min-height: 1.35em;
         pointer-events: auto;
+        cursor: text;
       }
 
       #${ROOT_ID} .dg-interim-tail {
@@ -245,6 +283,34 @@
     return root;
   }
 
+  function openControls() {
+    if (!state.root) return;
+    if (state.controlsHideTimer) {
+      clearTimeout(state.controlsHideTimer);
+      state.controlsHideTimer = null;
+    }
+    if (!state.root.classList.contains("dg-controls-open")) {
+      const rect = state.root.getBoundingClientRect ? state.root.getBoundingClientRect() : null;
+      if (rect && rect.width > 0) {
+        state.lockedWidth = Math.max(state.lockedWidth || 0, Math.ceil(rect.width));
+        state.root.style.minWidth = `${state.lockedWidth}px`;
+      }
+      state.root.classList.add("dg-controls-open");
+    }
+  }
+
+  function scheduleCloseControls() {
+    if (state.drag) return;
+    if (state.controlsHideTimer) clearTimeout(state.controlsHideTimer);
+    state.controlsHideTimer = setTimeout(() => {
+      state.controlsHideTimer = null;
+      if (state.drag || !state.root) return;
+      state.root.classList.remove("dg-controls-open");
+      state.lockedWidth = 0;
+      state.root.style.minWidth = "";
+    }, 500);
+  }
+
   function buildToolbar(root) {
     const toolbar = document.createElement("div");
     toolbar.className = "dg-toolbar";
@@ -252,7 +318,7 @@
     const dragHandle = document.createElement("button");
     dragHandle.type = "button";
     dragHandle.className = "dg-tool-button dg-drag-handle";
-    dragHandle.textContent = "⠿";
+    dragHandle.textContent = "⠿ Move";
     dragHandle.title = "Drag to move (double-click to reset)";
 
     const closeButton = document.createElement("button");
@@ -264,6 +330,18 @@
     toolbar.append(dragHandle, closeButton);
     root.appendChild(toolbar);
 
+    root.addEventListener("pointerenter", openControls);
+    root.addEventListener("pointerleave", scheduleCloseControls);
+    toolbar.addEventListener("pointerenter", openControls);
+    toolbar.addEventListener("pointerleave", scheduleCloseControls);
+
+    // Allow dragging from the handle OR from the palette's outer background/padding
+    // (outside text lines so text selection for Yomitan still works normally).
+    root.addEventListener("pointerdown", (event) => {
+      if (event.target === root || event.target === state.lineGroup) {
+        startDrag(event);
+      }
+    });
     dragHandle.addEventListener("pointerdown", startDrag);
     dragHandle.addEventListener("dblclick", resetPosition);
     closeButton.addEventListener("click", removeOverlay);
@@ -354,6 +432,14 @@
       setRowContent(node, row);
     }
 
+    if (state.root.classList.contains("dg-controls-open") && state.root.getBoundingClientRect) {
+      const w = Math.ceil(state.root.getBoundingClientRect().width || 0);
+      if (w > state.lockedWidth) {
+        state.lockedWidth = w;
+        state.root.style.minWidth = `${w}px`;
+      }
+    }
+
     applyPosition();
   }
 
@@ -427,6 +513,7 @@
 
   function resetPosition() {
     state.position = null;
+    savePosition(null);
     applyPosition();
   }
 
@@ -434,11 +521,20 @@
     if (!state.root) return;
     event.preventDefault();
     event.stopPropagation();
+    openControls();
 
     const rect = state.root.getBoundingClientRect();
     const vh = window.innerHeight || 720;
+    const captureTarget = event.currentTarget || state.root;
+    try {
+      captureTarget.setPointerCapture?.(event.pointerId);
+    } catch {
+      // Ignore synthetic events in tests without active pointer IDs.
+    }
+
     state.drag = {
       pointerId: event.pointerId,
+      captureTarget,
       startX: event.clientX,
       startY: event.clientY,
       centerX: rect.left + rect.width / 2,
@@ -468,15 +564,28 @@
 
   function stopDrag(event) {
     if (!state.drag || event.pointerId !== state.drag.pointerId) return;
+    const captureTarget = state.drag.captureTarget;
+    try {
+      captureTarget?.releasePointerCapture?.(event.pointerId);
+    } catch {
+      // Ignore if capture was already released.
+    }
     state.drag = null;
     state.root?.classList.remove("dg-dragging");
     window.removeEventListener("pointermove", dragOverlay, true);
     window.removeEventListener("pointerup", stopDrag, true);
     window.removeEventListener("pointercancel", stopDrag, true);
+    savePosition(state.position);
+    scheduleCloseControls();
     renderLines();
   }
 
   function removeOverlay() {
+    if (state.controlsHideTimer) {
+      clearTimeout(state.controlsHideTimer);
+      state.controlsHideTimer = null;
+    }
+    state.lockedWidth = 0;
     state.root?.remove();
     state.root = null;
     state.lineGroup = null;
@@ -591,6 +700,7 @@
     if (message.type === MSG.RESET_OVERLAY) {
       state.dismissed = false;
       state.position = null;
+      savePosition(null);
       ensureRoot();
       applySettings(state.settings);
       return;
@@ -714,4 +824,5 @@
   });
 
   ensureRoot();
+  loadSavedPosition();
 })();
