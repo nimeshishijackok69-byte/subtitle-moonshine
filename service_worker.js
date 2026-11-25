@@ -394,6 +394,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       case MSG.APPLY_SETTINGS:
         return applySettings(message);
 
+      case MSG.RESET_OVERLAY: {
+        const targetTabId = activeTabId || message.tabId;
+        if (targetTabId) {
+          await ensureOverlayAndSend(targetTabId, { type: MSG.RESET_OVERLAY });
+        }
+        return { ok: true };
+      }
+
       case MSG.GET_STATUS:
         await getLiveOffscreenStatus();
         return {

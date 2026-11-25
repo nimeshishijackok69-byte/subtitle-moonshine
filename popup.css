@@ -55,6 +55,13 @@ p {
   white-space: nowrap;
 }
 
+#statusText.is-error {
+  color: #d63a2f;
+  white-space: normal;
+  word-break: break-word;
+  line-height: 1.35;
+}
+
 .status-dot {
   width: 12px;
   height: 12px;
@@ -120,6 +127,7 @@ button.saved {
   grid-column: 1 / -1;
   width: 100%;
   accent-color: #0d9488;
+  cursor: pointer;
 }
 
 .range-field strong {

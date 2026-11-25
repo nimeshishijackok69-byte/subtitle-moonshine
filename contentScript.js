@@ -5,7 +5,8 @@
       DG_TRANSCRIPT: "DG_TRANSCRIPT",
       CLEAR_INTERIM: "CLEAR_INTERIM",
       CLEAR_ALL: "CLEAR_ALL",
-      REMOVE_OVERLAY: "REMOVE_OVERLAY"
+      REMOVE_OVERLAY: "REMOVE_OVERLAY",
+      RESET_OVERLAY: "RESET_OVERLAY"
     }
   };
 
@@ -55,9 +56,14 @@
     activeLineText: "",
     interimTail: "",
     finalizedLineId: null,
-    dismissed: false
+    dismissed: false,
+    pendingRender: false
   };
   globalThis[STATE_KEY] = state;
+
+  function getMountParent() {
+    return document.fullscreenElement || document.webkitFullscreenElement || document.body || document.documentElement;
+  }
 
   function ensureStyle() {
     if (document.getElementById(STYLE_ID)) {
@@ -71,11 +77,19 @@
         position: fixed;
         left: 50%;
         bottom: 6%;
+        top: auto;
         transform: translateX(-50%);
         z-index: 2147483647;
-        pointer-events: none;
+        pointer-events: auto;
         user-select: text;
+        -webkit-user-select: text;
         font-family: "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Yu Gothic", "Meiryo", sans-serif;
+        font-style: normal;
+        font-weight: 500;
+        text-transform: none;
+        text-decoration: none;
+        text-indent: 0;
+        word-spacing: normal;
         text-shadow:
           -2px -2px 0 #000,
            2px -2px 0 #000,
@@ -88,46 +102,80 @@
            0    3px 6px rgba(0, 0, 0, 0.85);
         color: #ffffff;
         text-align: center;
+        margin: 0;
+        border: none;
+        outline: none;
         padding: 10px 16px;
         border-radius: 8px;
         background: rgba(0, 0, 0, 0.45);
+        width: max-content;
         max-width: min(92vw, 1100px);
-        min-width: 240px;
+        min-width: 120px;
         line-height: 1.35;
         letter-spacing: 0.03em;
         white-space: pre-wrap;
         box-sizing: border-box;
+        transition: opacity 120ms ease;
+      }
+
+      #${ROOT_ID}.dg-empty {
+        opacity: 0;
+        visibility: hidden;
+        pointer-events: none;
       }
 
       #${ROOT_ID} .dg-toolbar {
         position: absolute;
-        top: -30px;
+        top: -32px;
         right: 0;
         display: none;
         gap: 6px;
         pointer-events: auto;
-        /* Extends the toolbar's own hit area down to the root's top edge.
-           Without it there is an 8px dead band between them: the pointer leaves
-           #ROOT, :hover drops, the toolbar hides, and the X becomes unhittable. */
-        padding-bottom: 12px;
+        padding-bottom: 10px;
       }
 
-      #${ROOT_ID}:hover .dg-toolbar {
+      #${ROOT_ID}.dg-toolbar-bottom .dg-toolbar {
+        top: auto;
+        bottom: -32px;
+        padding-bottom: 0;
+        padding-top: 10px;
+      }
+
+      #${ROOT_ID}:hover .dg-toolbar,
+      #${ROOT_ID}.dg-dragging .dg-toolbar {
         display: flex;
       }
 
       #${ROOT_ID} .dg-tool-button {
-        border: none;
+        all: unset;
+        box-sizing: border-box;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
         border-radius: 4px;
-        background: rgba(0, 0, 0, 0.7);
+        border: 1px solid rgba(255, 255, 255, 0.18);
+        background: rgba(15, 18, 20, 0.85);
         color: #ffffff;
+        font-family: system-ui, -apple-system, sans-serif;
         font-size: 12px;
-        padding: 4px 8px;
+        line-height: 1;
+        padding: 5px 8px;
+        text-shadow: none;
         cursor: pointer;
+        user-select: none;
+      }
+
+      #${ROOT_ID} .dg-tool-button:hover {
+        background: rgba(35, 42, 48, 0.95);
+        border-color: rgba(255, 255, 255, 0.4);
       }
 
       #${ROOT_ID} .dg-drag-handle {
-        cursor: move;
+        cursor: grab;
+      }
+
+      #${ROOT_ID}.dg-dragging .dg-drag-handle {
+        cursor: grabbing;
       }
 
       #${ROOT_ID} .dg-line-group {
@@ -148,35 +196,50 @@
       }
     `;
 
-    document.head.appendChild(style);
+    (document.head || document.documentElement).appendChild(style);
+  }
+
+  function syncMountTarget() {
+    if (!state.root) return;
+    const target = getMountParent();
+    if (target && state.root.parentNode !== target) {
+      target.appendChild(state.root);
+      applyPosition();
+    }
   }
 
   function ensureRoot() {
     // A dismissed overlay stays dismissed until the next session starts
-    // (CLEAR_ALL). Without this, every incoming transcript resurrects it.
+    // (CLEAR_ALL) or the user explicitly resets it (RESET_OVERLAY).
     if (state.dismissed) {
       return null;
     }
 
-    if (state.root && document.body.contains(state.root)) {
+    const mountParent = getMountParent();
+    if (state.root && mountParent?.contains(state.root)) {
+      return state.root;
+    }
+
+    if (state.root && document.contains(state.root)) {
+      syncMountTarget();
       return state.root;
     }
 
     // An overlay left behind by a previous injection (extension reload/update
-    // while a session was live) has dead listeners. Drop it rather than adopt it,
-    // otherwise two nodes share the id and one of them can never be closed.
+    // while a session was live) has dead listeners. Drop it rather than adopt it.
     document.getElementById(ROOT_ID)?.remove();
 
     ensureStyle();
 
     const root = document.createElement("div");
     root.id = ROOT_ID;
+    root.className = "dg-empty";
     root.setAttribute("lang", "ja");
     root.setAttribute("translate", "no");
     state.root = root;
 
     buildToolbar(root);
-    document.body.appendChild(root);
+    mountParent.appendChild(root);
     rebuildLineNodes();
     applySettings(state.settings);
     return root;
@@ -189,19 +252,20 @@
     const dragHandle = document.createElement("button");
     dragHandle.type = "button";
     dragHandle.className = "dg-tool-button dg-drag-handle";
-    dragHandle.textContent = "::";
-    dragHandle.title = "Move subtitles";
+    dragHandle.textContent = "⠿";
+    dragHandle.title = "Drag to move (double-click to reset)";
 
     const closeButton = document.createElement("button");
     closeButton.type = "button";
     closeButton.className = "dg-tool-button";
-    closeButton.textContent = "x";
-    closeButton.title = "Remove subtitles";
+    closeButton.textContent = "✕";
+    closeButton.title = "Hide subtitles";
 
     toolbar.append(dragHandle, closeButton);
     root.appendChild(toolbar);
 
     dragHandle.addEventListener("pointerdown", startDrag);
+    dragHandle.addEventListener("dblclick", resetPosition);
     closeButton.addEventListener("click", removeOverlay);
   }
 
@@ -236,7 +300,8 @@
     };
     state.settings.lines = Math.max(1, Math.min(5, Number(state.settings.lines) || defaults.lines));
     state.settings.fontSize = Number(state.settings.fontSize) || defaults.fontSize;
-    state.settings.opacity = Number(state.settings.opacity) || defaults.opacity;
+    const nextOpacity = Number(state.settings.opacity);
+    state.settings.opacity = Number.isFinite(nextOpacity) ? nextOpacity : defaults.opacity;
     state.settings.showInterim = Boolean(state.settings.showInterim);
 
     if (!state.root) return; // Guard: do not resurrect on settings update if user dismissed
@@ -248,16 +313,25 @@
 
     state.root.style.fontSize = `${state.settings.fontSize}px`;
     state.root.style.background = `rgba(0, 0, 0, ${state.settings.opacity})`;
-    applyPosition();
     renderLines();
   }
 
-  // The overlay is exactly `settings.lines` rows at all times. The active
-  // utterance occupies the last row and carries its unstable tail inline, so a
-  // sentence never straddles two rows and the box never gains or loses a row
-  // mid-session. (A long row can still wrap to a second visual line.)
+  function hasActiveSelection() {
+    if (!state.root || typeof window.getSelection !== "function") return false;
+    const sel = window.getSelection();
+    if (!sel || sel.isCollapsed || !sel.rangeCount) return false;
+    return state.root.contains(sel.anchorNode) || state.root.contains(sel.focusNode);
+  }
+
+  // Only non-empty rows are shown; empty slots are hidden so the box shrinks to
+  // fit active subtitles and collapses completely (click-through) when silent.
   function renderLines() {
     if (!state.root || !state.finalNodes.length) return;
+    if (hasActiveSelection() && !state.drag) {
+      state.pendingRender = true;
+      return;
+    }
+    state.pendingRender = false;
 
     const showInterim = state.settings.showInterim;
     const rows = state.finalLines.map((text) => ({ text, tail: "" }));
@@ -270,11 +344,17 @@
     }
 
     const visible = rows.slice(-state.settings.lines);
-    const blankCount = state.settings.lines - visible.length;
+    const isEmpty = visible.length === 0 && !state.drag;
+    state.root.classList.toggle("dg-empty", isEmpty);
 
     for (let i = 0; i < state.finalNodes.length; i += 1) {
-      setRowContent(state.finalNodes[i], visible[i - blankCount]);
+      const node = state.finalNodes[i];
+      const row = visible[i];
+      node.style.display = row ? "" : "none";
+      setRowContent(node, row);
     }
+
+    applyPosition();
   }
 
   // Writes a row as [stable committed text][dimmed tail]. The tail span is
@@ -315,11 +395,39 @@
   }
 
   function applyPosition() {
-    if (!state.root || !state.position) return;
-    state.root.style.left = `${state.position.left}px`;
-    state.root.style.top = `${state.position.top}px`;
-    state.root.style.bottom = "auto";
-    state.root.style.transform = "none";
+    if (!state.root) return;
+    const vw = window.innerWidth || 1280;
+    const vh = window.innerHeight || 720;
+    const rect = state.root.getBoundingClientRect ? state.root.getBoundingClientRect() : { width: 0, height: 0, top: vh * 0.9 };
+
+    if (!state.position) {
+      state.root.style.left = "";
+      state.root.style.top = "";
+      state.root.style.bottom = "";
+      state.root.style.transform = "";
+      state.root.classList.toggle("dg-toolbar-bottom", rect.top > 0 && rect.top < 40);
+      return;
+    }
+
+    const halfW = (rect.width || 0) / 2;
+    const minCenter = Math.min(vw / 2, halfW + 8);
+    const maxCenter = Math.max(vw / 2, vw - halfW - 8);
+    const centerX = Math.max(minCenter, Math.min(state.position.centerXRatio * vw, maxCenter));
+    const maxBottom = Math.max(8, vh - (rect.height || 0) - 8);
+    const bottom = Math.max(8, Math.min(state.position.bottomPx, maxBottom));
+
+    state.root.style.left = `${centerX}px`;
+    state.root.style.bottom = `${bottom}px`;
+    state.root.style.top = "auto";
+    state.root.style.transform = "translateX(-50%)";
+
+    const topEdge = vh - bottom - (rect.height || 0);
+    state.root.classList.toggle("dg-toolbar-bottom", topEdge < 40);
+  }
+
+  function resetPosition() {
+    state.position = null;
+    applyPosition();
   }
 
   function startDrag(event) {
@@ -328,15 +436,16 @@
     event.stopPropagation();
 
     const rect = state.root.getBoundingClientRect();
+    const vh = window.innerHeight || 720;
     state.drag = {
       pointerId: event.pointerId,
       startX: event.clientX,
       startY: event.clientY,
-      left: rect.left,
-      top: rect.top,
-      width: rect.width,
-      height: rect.height
+      centerX: rect.left + rect.width / 2,
+      bottomPx: vh - rect.bottom
     };
+    state.root.classList.add("dg-dragging");
+    state.root.classList.remove("dg-empty");
 
     window.addEventListener("pointermove", dragOverlay, true);
     window.addEventListener("pointerup", stopDrag, true);
@@ -346,14 +455,13 @@
   function dragOverlay(event) {
     if (!state.drag || event.pointerId !== state.drag.pointerId) return;
 
-    const nextLeft = state.drag.left + event.clientX - state.drag.startX;
-    const nextTop = state.drag.top + event.clientY - state.drag.startY;
-    const maxLeft = window.innerWidth - state.drag.width - 8;
-    const maxTop = window.innerHeight - state.drag.height - 8;
+    const vw = window.innerWidth || 1280;
+    const nextCenterX = state.drag.centerX + (event.clientX - state.drag.startX);
+    const nextBottom = state.drag.bottomPx - (event.clientY - state.drag.startY);
 
     state.position = {
-      left: Math.max(8, Math.min(nextLeft, maxLeft)),
-      top: Math.max(8, Math.min(nextTop, maxTop))
+      centerXRatio: Math.max(0, Math.min(1, nextCenterX / Math.max(1, vw))),
+      bottomPx: nextBottom
     };
     applyPosition();
   }
@@ -361,9 +469,11 @@
   function stopDrag(event) {
     if (!state.drag || event.pointerId !== state.drag.pointerId) return;
     state.drag = null;
+    state.root?.classList.remove("dg-dragging");
     window.removeEventListener("pointermove", dragOverlay, true);
     window.removeEventListener("pointerup", stopDrag, true);
     window.removeEventListener("pointercancel", stopDrag, true);
+    renderLines();
   }
 
   function removeOverlay() {
@@ -375,6 +485,15 @@
     state.activeLineText = "";
     state.dismissed = true;
   }
+
+  document.addEventListener("fullscreenchange", syncMountTarget);
+  document.addEventListener("webkitfullscreenchange", syncMountTarget);
+  window.addEventListener("resize", applyPosition);
+  document.addEventListener("selectionchange", () => {
+    if (state.pendingRender && !hasActiveSelection()) {
+      renderLines();
+    }
+  });
 
   // ─── High-Precision Telemetry Store & Analysis Harness ──────────────
   const telemetry = {
@@ -466,6 +585,14 @@
 
     if (message.type === MSG.REMOVE_OVERLAY) {
       removeOverlay();
+      return;
+    }
+
+    if (message.type === MSG.RESET_OVERLAY) {
+      state.dismissed = false;
+      state.position = null;
+      ensureRoot();
+      applySettings(state.settings);
       return;
     }
 

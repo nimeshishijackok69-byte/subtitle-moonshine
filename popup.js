@@ -45,12 +45,14 @@ const els = {
   hotwords: document.getElementById("hotwords"),
   start: document.getElementById("start"),
   stop: document.getElementById("stop"),
+  resetOverlay: document.getElementById("resetOverlay"),
   copyDiagnostics: document.getElementById("copyDiagnostics"),
   statusText: document.getElementById("statusText"),
   statusDot: document.getElementById("statusDot")
 };
 
 let overlaySaveTimer = null;
+let hotwordsApplyTimer = null;
 
 function storageGet(keys) {
   return chrome.storage.local.get(keys);
@@ -103,6 +105,7 @@ function setStatus(state, detail = "") {
   els.statusDot.dataset.state = state;
   els.statusText.textContent = text;
   els.statusText.title = text;
+  els.statusText.classList.toggle("is-error", state === STATE.ERROR);
   els.statusDot.classList.toggle("live", state === STATE.LISTENING);
   els.statusDot.classList.toggle("error", state === STATE.ERROR);
   updateStartState();
@@ -472,9 +475,37 @@ async function load() {
 
 }
 
-for (const input of [els.lines, els.fontSize, els.opacity, els.showInterim, els.hotwords].filter(Boolean)) {
+for (const input of [els.lines, els.fontSize, els.opacity, els.showInterim]) {
   input.addEventListener("input", () => {
     applyOverlaySettingsToTab().catch((error) => setStatus(STATE.ERROR, error.message));
+  });
+}
+
+if (els.hotwords) {
+  els.hotwords.addEventListener("input", () => {
+    scheduleOverlaySettingsSave();
+    window.clearTimeout(hotwordsApplyTimer);
+    hotwordsApplyTimer = window.setTimeout(() => {
+      applyOverlaySettingsToTab().catch((error) => setStatus(STATE.ERROR, error.message));
+    }, 300);
+  });
+}
+
+if (els.resetOverlay) {
+  els.resetOverlay.addEventListener("click", async () => {
+    try {
+      const tabId = await getActiveTabId();
+      await chrome.runtime.sendMessage({ type: MSG.RESET_OVERLAY, tabId });
+      const label = els.resetOverlay.textContent;
+      els.resetOverlay.textContent = "Reset ✓";
+      els.resetOverlay.classList.add("saved");
+      window.setTimeout(() => {
+        els.resetOverlay.textContent = label;
+        els.resetOverlay.classList.remove("saved");
+      }, 1200);
+    } catch (error) {
+      setStatus(STATE.ERROR, error.message);
+    }
   });
 }
 

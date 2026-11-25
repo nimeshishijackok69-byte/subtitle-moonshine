@@ -11,7 +11,7 @@
       <header class="header">
         <div>
           <h1>Live Subtitles</h1>
-          <p id="statusText" title="Idle">Idle</p>
+          <p id="statusText" title="Idle" aria-live="polite">Idle</p>
         </div>
         <span id="statusDot" class="status-dot" aria-hidden="true"></span>
       </header>
@@ -43,6 +43,7 @@
         <label class="field">
           <span>Hotwords (optional names/terms)</span>
           <input id="hotwords" type="text" placeholder="ルーディ, ゼニス, パウロ">
+          <span class="hint">Comma-separated names or terms, boosted on final lines.</span>
         </label>
       </section>
 
@@ -52,7 +53,10 @@
       </section>
 
       <section class="section diagnostics">
-        <button id="copyDiagnostics" type="button" class="secondary">Copy diagnostics</button>
+        <div class="button-row">
+          <button id="resetOverlay" type="button" class="secondary">Reset overlay</button>
+          <button id="copyDiagnostics" type="button" class="secondary">Copy diagnostics</button>
+        </div>
         <p class="hint">
           Version, state, timings and the last errors. No audio, no tab titles, no URLs.
         </p>
