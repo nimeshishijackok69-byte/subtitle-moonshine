@@ -361,6 +361,14 @@ async function applySettings({ tabId, config }) {
     });
   }
 
+  if (await hasOffscreenDocument().catch(() => false)) {
+    chrome.runtime.sendMessage({
+      type: MSG.APPLY_SETTINGS,
+      target: "offscreen",
+      config
+    }).catch(() => {});
+  }
+
   return { ok: true };
 }
 

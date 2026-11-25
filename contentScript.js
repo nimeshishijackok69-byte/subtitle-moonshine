@@ -306,10 +306,10 @@
 
   function commitFinal(text) {
     const cleanText = text.trim();
-    if (!cleanText) return;
-
-    state.finalLines.push(cleanText);
-    state.finalLines = state.finalLines.slice(-state.settings.lines);
+    if (cleanText) {
+      state.finalLines.push(cleanText);
+      state.finalLines = state.finalLines.slice(-state.settings.lines);
+    }
     state.interimTail = "";
     renderLines();
   }

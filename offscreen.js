@@ -5,40 +5,26 @@ DIAG.install();
 const TARGET_SAMPLE_RATE = 16000;
 const VAD_FRAME_SAMPLES = 512;
 const VAD_CONTEXT_SAMPLES = 64; // Silero v5 reference wrapper carries 64 samples of left context
-const VAD_SPEECH_THRESHOLD = 0.50; // Speech onset threshold
-const VAD_CONTINUE_THRESHOLD = 0.35; // Keeps a decaying tail attached to the utterance
+const VAD_SPEECH_THRESHOLD = 0.25; // Recovers quiet & BGM-layered speech; CTC confidence gate filters non-speech
+const VAD_CONTINUE_THRESHOLD = 0.20; // Keeps soft sentence endings and particles attached
 const VAD_SPEECH_ONSET_FRAMES = 3; // 3 consecutive frames (~96ms) to trigger onset
 // Endpoint = pure latency: the final decode cannot start until this much
-// silence is seen, and the user is staring at a stale line meanwhile. 640 ms
-// (20 frames) was a VAD-safety margin measured on the Silero v5 wrapper, not a
-// speech requirement.
-//
-// Expressed in frames, not milliseconds, because `silenceSamples` advances by
-// VAD_FRAME_SAMPLES (512) per frame and the gate is `>=`: a millisecond value
-// silently rounds UP to the next 32 ms boundary (0.45 s became 15 frames =
-// 480 ms). 15 frames = 480 ms removes 160 ms from every line while keeping
-// ~15 frames of hysteresis; an utterance still only closes below
-// VAD_CONTINUE_THRESHOLD, so a pause inside a sentence needs roughly 2x this
-// to split it. Benchmark F-010 / F-012, PLAN_10X §2.
+// silence is seen, and the user is staring at a stale line meanwhile. 15
+// frames = 480 ms keeps ~15 frames of hysteresis below VAD_CONTINUE_THRESHOLD.
 const END_SILENCE_FRAMES = 15;
 const END_SILENCE_SAMPLES = END_SILENCE_FRAMES * VAD_FRAME_SAMPLES;
-const ANCHOR_PREROLL_SAMPLES = Math.round(0.30 * TARGET_SAMPLE_RATE); // 0.30s anchor preroll (4,800 samples)
-const TAIL_PAD_SAMPLES = Math.round(0.20 * TARGET_SAMPLE_RATE); // 0.20s tail pad (3,200 samples)
-// Decode window floor. The window spans ANCHOR_PREROLL (0.3 s) + speech +
-// TAIL_PAD (0.2 s), so 1.0 s of window is ~0.5 s of actual speech. A shorter
-// window is widened backwards into the ring (or left-padded with silence at
-// stream start) rather than dropped: `はい` / `ただ。` / `それから？` are real
-// speech, and the CTC encoder needs buffer length, not speech duration.
+const ANCHOR_PREROLL_SAMPLES = Math.round(0.40 * TARGET_SAMPLE_RATE); // 0.40s preroll (6,400 samples, 0ms added latency)
+const TAIL_PAD_SAMPLES = Math.round(0.35 * TARGET_SAMPLE_RATE); // 0.35s tail pad (5,600 samples, inside 480ms endpoint)
+// Decode window floor. The window spans preroll + speech + tail pad. A shorter
+// window widens backwards into the ring (using real preceding audio masked by
+// emitFrom, or left-padded with silence at stream start) rather than dropped.
 const MIN_UTTERANCE_SAMPLES = Math.round(1.0 * TARGET_SAMPLE_RATE);
-const MAX_UTTERANCE_SAMPLES = Math.round(8.0 * TARGET_SAMPLE_RATE); // 8.0s cap per utterance
-// 500 ms cadence: decode is ~10% of the latency path (browser: ~150 ms mean,
-// 329 ms max at 4 WASM threads, F-010), and the shipped 750 ms tick was the
-// single largest avoidable delay. A displayed line is at most one tick stale,
-// so this removes up to 250 ms (mean ~125 ms, since the wait to the next tick
-// is uniform). At 500 ms the worst-case 8 s decode (~330 ms) is 66% of the tick
-// and mean duty is ~30% (F-009 headroom), so it fits without dropping a PCM
-// chunk — but a decode IS in flight ~30% of the time, which adds queue wait
-// ahead of the final decode when the endpoint fires.
+const MIN_POST_SPLIT_NEW_SAMPLES = Math.round(0.40 * TARGET_SAMPLE_RATE);
+const SPLIT_SEARCH_MIN_SAMPLES = Math.round(4.5 * TARGET_SAMPLE_RATE);
+const SPLIT_TRIGGER_SAMPLES = Math.round(7.4 * TARGET_SAMPLE_RATE);
+const SPLIT_LEFT_CONTEXT_SAMPLES = Math.round(0.60 * TARGET_SAMPLE_RATE); // 0.60s left context for bidirectional encoder
+const MAX_UTTERANCE_SAMPLES = Math.round(8.0 * TARGET_SAMPLE_RATE); // 8.0s hard cap per utterance
+const LFR_FRAME_SAMPLES = 160 * 6; // 10ms STFT shift * LFR stride 6 = 960 samples (60ms) per CTC output frame
 const DECODE_STEP_MS = 500;
 const HOLDBACK_CHARS = 4; // 4 characters holdback for local agreement
 const ASR_STOP_TIMEOUT_MS = 2000; // upper bound on awaiting a decode during stop
@@ -61,6 +47,8 @@ let offscreenState = STATE.IDLE;
 
 // ─── Silero VAD (Fixed 576-sample layout with 64-sample rolling context) ───
 let vadSession = null, vadState = null, vadSr = null, vadContext = null, vadLoaded = false;
+const vadInputBuffer = new Float32Array(VAD_CONTEXT_SAMPLES + VAD_FRAME_SAMPLES);
+const vadFloatFrame = new Float32Array(VAD_FRAME_SAMPLES);
 
 async function loadVad() {
   if (vadLoaded) return;
@@ -85,11 +73,10 @@ function resetVadState() {
 
 async function runVad(float32Audio) {
   if (!vadSession) return 1.0;
-  const input = new Float32Array(VAD_CONTEXT_SAMPLES + float32Audio.length);
-  input.set(vadContext, 0);
-  input.set(float32Audio, VAD_CONTEXT_SAMPLES);
+  vadInputBuffer.set(vadContext, 0);
+  vadInputBuffer.set(float32Audio, VAD_CONTEXT_SAMPLES);
   const r = await vadSession.run({
-    input: new ort.Tensor("float32", input, [1, input.length]),
+    input: new ort.Tensor("float32", vadInputBuffer, [1, vadInputBuffer.length]),
     state: vadState,
     sr: vadSr
   });
@@ -99,22 +86,79 @@ async function runVad(float32Audio) {
 }
 
 // ─── SenseVoice ONNX Engine ────────────────────────────────────────
-let asrSession = null, asrFrontend = null, asrTokens = null, asrLoaded = false;
+let asrSession = null, asrFrontend = null, asrTokens = null, asrTextToId = null, asrLoaded = false;
 const SENSEVOICE_MODEL = "models/sensevoice/model.int8.onnx";
 const SENSEVOICE_TOKENS = "models/sensevoice/tokens.txt";
 const SENSEVOICE_FRONTEND = "models/sensevoice/frontend.json";
 
 function parseTokenTable(text) {
   const map = new Map();
+  const reverse = new Map();
   for (const line of text.split(/\r?\n/)) {
     const idx = line.lastIndexOf(" ");
     if (idx !== -1) {
       const token = line.slice(0, idx);
       const id = Number(line.slice(idx + 1));
-      if (!Number.isNaN(id)) map.set(id, token);
+      if (!Number.isNaN(id)) {
+        map.set(id, token);
+        const clean = token.replace(/▁/g, "");
+        if (clean && !clean.startsWith("<|") && !reverse.has(clean)) {
+          reverse.set(clean, id);
+        }
+      }
     }
   }
-  return map;
+  return { map, reverse };
+}
+
+function parseHotwordsInput(raw) {
+  if (!raw) return [];
+  const items = Array.isArray(raw) ? raw : String(raw).split(/[\r\n,、]+/);
+  return items.map((s) => String(s || "").trim().normalize("NFKC")).filter((s) => s.length >= 2);
+}
+
+function tokenizeHotword(word) {
+  if (!asrTextToId) return null;
+  const ids = [];
+  let i = 0;
+  while (i < word.length) {
+    let matched = false;
+    for (let len = Math.min(8, word.length - i); len >= 1; len -= 1) {
+      const sub = word.slice(i, i + len);
+      const id = (i === 0 ? asrTextToId.get("▁" + sub) : undefined) ?? asrTextToId.get(sub);
+      if (id !== undefined) {
+        ids.push(id);
+        i += len;
+        matched = true;
+        break;
+      }
+    }
+    if (!matched) return null;
+  }
+  return ids.length ? ids : null;
+}
+
+function buildHotwordTrie(rawHotwords) {
+  const list = parseHotwordsInput(rawHotwords);
+  if (!list.length || !asrTextToId) return null;
+  const root = { children: new Map(), pot: 0, isEnd: false };
+  let count = 0;
+  for (const word of list) {
+    const seq = tokenizeHotword(word);
+    if (!seq) continue;
+    let node = root;
+    for (let d = 0; d < seq.length; d += 1) {
+      const id = seq[d];
+      if (!node.children.has(id)) {
+        node.children.set(id, { children: new Map(), pot: (d + 1) / seq.length, isEnd: false });
+      }
+      node = node.children.get(id);
+    }
+    node.isEnd = true;
+    node.pot = 1.0;
+    count += 1;
+  }
+  return count > 0 ? root : null;
 }
 
 async function loadAsr() {
@@ -130,7 +174,9 @@ async function loadAsr() {
   if (!frontendResp.ok || !tokensResp.ok) throw new Error("Unable to load SenseVoice assets");
 
   asrFrontend = new SenseVoiceFrontend(await frontendResp.json());
-  asrTokens = parseTokenTable(await tokensResp.text());
+  const parsed = parseTokenTable(await tokensResp.text());
+  asrTokens = parsed.map;
+  asrTextToId = parsed.reverse;
   asrSession = await ort.InferenceSession.create(
     chrome.runtime.getURL(SENSEVOICE_MODEL),
     { executionProviders: ["wasm"], graphOptimizationLevel: "all" }
@@ -142,30 +188,175 @@ async function loadAsr() {
   DIAG.mark("asr", "session created");
 }
 
-function decodeSenseVoice(logits) {
+function passesConfidenceGate(tokenCount, probSum, eventTag) {
+  if (tokenCount === 0) return false;
+  const meanP = probSum / tokenCount;
+  if (meanP < 0.50) return false;
+  if (tokenCount <= 6 && meanP < 0.60) return false;
+  if ((eventTag === "<|BGM|>" || eventTag === "<|nospeech|>") && tokenCount <= 8 && meanP < 0.65) {
+    return false;
+  }
+  return true;
+}
+
+function frameTokenProb(data, base, vocab, bestScore) {
+  let sum = 0;
+  const cutoff = bestScore - 15;
+  for (let id = 0; id < vocab; id += 1) {
+    const s = data[base + id];
+    if (s > cutoff) sum += Math.exp(s - bestScore);
+  }
+  return 1 / sum;
+}
+
+function hotwordBeamIds(data, startFrame, frames, vocab, trieRoot, beamWidth = 8, topK = 8, hwScale = 2.5) {
+  const NEG_INF = -1e30;
+  const logAdd = (a, b) => (a <= NEG_INF ? b : b <= NEG_INF ? a : (a > b ? a + Math.log1p(Math.exp(b - a)) : b + Math.log1p(Math.exp(a - b))));
+  const topIdx = new Int32Array(topK);
+  const topVal = new Float32Array(topK);
+  let beams = [{ key: "", parent: null, token: -1, pb: 0, pnb: NEG_INF, trie: trieRoot, lp: 0 }];
+
+  for (let t = startFrame; t < frames; t += 1) {
+    const base = t * vocab;
+    let maxL = -Infinity;
+    for (let v = 0; v < vocab; v += 1) {
+      const s = data[base + v];
+      if (s > maxL) maxL = s;
+    }
+    let sumExp = 0;
+    const cut = maxL - 15;
+    for (let v = 0; v < vocab; v += 1) {
+      const s = data[base + v];
+      if (s > cut) sumExp += Math.exp(s - maxL);
+    }
+    const lse = maxL + Math.log(sumExp);
+    const blankLp = data[base] - lse;
+
+    topIdx.fill(-1);
+    topVal.fill(-Infinity);
+    for (let v = 1; v < vocab; v += 1) {
+      const lp = data[base + v] - lse;
+      if (lp <= topVal[topK - 1]) continue;
+      let pos = topK - 1;
+      while (pos > 0 && topVal[pos - 1] < lp) {
+        topVal[pos] = topVal[pos - 1];
+        topIdx[pos] = topIdx[pos - 1];
+        pos -= 1;
+      }
+      topVal[pos] = lp;
+      topIdx[pos] = v;
+    }
+
+    const next = new Map();
+    const ensure = (key, parent, token, trie, lp) => {
+      let b = next.get(key);
+      if (!b) {
+        b = { key, parent, token, pb: NEG_INF, pnb: NEG_INF, trie, lp };
+        next.set(key, b);
+      }
+      return b;
+    };
+
+    for (const beam of beams) {
+      const total = logAdd(beam.pb, beam.pnb);
+      const same = ensure(beam.key, beam.parent, beam.token, beam.trie, beam.lp);
+      same.pb = logAdd(same.pb, total + blankLp);
+
+      for (let i = 0; i < topK; i += 1) {
+        const c = topIdx[i];
+        if (c < 0) continue;
+        if (c === beam.token) {
+          same.pnb = logAdd(same.pnb, beam.pnb + topVal[i]);
+        } else {
+          // Potential-based transition: completed hotwords reset potential to 0 so
+          // partial prefix bonuses are refunded on mismatch (zero false-trigger bias).
+          const prevPot = beam.trie.isEnd ? 0 : beam.trie.pot;
+          const nt = beam.trie.children.get(c) || trieRoot.children.get(c) || trieRoot;
+          const delta = (nt.pot - prevPot) * hwScale;
+          const nKey = beam.key ? `${beam.key},${c}` : String(c);
+          const nb = ensure(nKey, beam, c, nt, topVal[i]);
+          nb.pnb = logAdd(nb.pnb, total + topVal[i] + delta);
+        }
+      }
+    }
+    beams = [...next.values()].sort((a, b) => logAdd(b.pb, b.pnb) - logAdd(a.pb, a.pnb)).slice(0, beamWidth);
+  }
+
+  const best = beams[0];
+  const out = [];
+  for (let cur = best; cur && cur.token !== -1; cur = cur.parent) {
+    out.push({ id: cur.token, p: Math.exp(cur.lp) });
+  }
+  return out.reverse();
+}
+
+function decodeSenseVoice(logits, options = {}) {
   if (!logits || !asrTokens) return "";
   const dims = logits.dims;
   const frames = dims[dims.length - 2];
   const vocab = dims[dims.length - 1];
-  let text = "";
-  let previous = -1;
+  const data = logits.data;
+  const prefixFrames = Math.max(0, options.prefixFrames || 0);
+  const skipFrames = Math.max(0, options.skipFrames || 0);
+  const startFrame = prefixFrames + skipFrames;
 
-  for (let frame = 0; frame < frames; frame += 1) {
-    const base = frame * vocab;
-    let best = 0;
-    let bestScore = -Infinity;
+  let eventTag = "";
+  if (frames > 2) {
+    const base2 = 2 * vocab;
+    let best2 = 0;
+    let bestS2 = -Infinity;
     for (let id = 0; id < vocab; id += 1) {
-      const score = logits.data[base + id];
-      if (score > bestScore) { bestScore = score; best = id; }
+      const s = data[base2 + id];
+      if (s > bestS2) { bestS2 = s; best2 = id; }
     }
-    if (best !== 0 && best !== previous) text += asrTokens.get(best) || "";
-    previous = best;
+    eventTag = asrTokens.get(best2) || "";
   }
 
-  return text.replace(/▁/g, " ").replace(/<\|[^|]*\|>/g, "").trim();
+  let text = "";
+  let tokenCount = 0;
+  let probSum = 0;
+
+  if (options.hotwordTrie) {
+    const items = hotwordBeamIds(data, startFrame, frames, vocab, options.hotwordTrie);
+    for (const item of items) {
+      const tok = asrTokens.get(item.id) || "";
+      if (tok.startsWith("<|")) continue;
+      text += tok;
+      probSum += item.p;
+      tokenCount += 1;
+    }
+  } else {
+    let previous = -1;
+    for (let frame = startFrame; frame < frames; frame += 1) {
+      const base = frame * vocab;
+      let best = 0;
+      let bestScore = -Infinity;
+      for (let id = 0; id < vocab; id += 1) {
+        const score = data[base + id];
+        if (score > bestScore) { bestScore = score; best = id; }
+      }
+      if (best !== 0 && best !== previous) {
+        const tok = asrTokens.get(best) || "";
+        if (!tok.startsWith("<|")) {
+          probSum += frameTokenProb(data, base, vocab, bestScore);
+          tokenCount += 1;
+          text += tok;
+        }
+      }
+      previous = best;
+    }
+  }
+
+  const cleaned = text.replace(/▁/g, " ").replace(/<\|[^|]*\|>/g, "").trim();
+  if (!cleaned) return "";
+  if (!passesConfidenceGate(tokenCount, probSum, eventTag)) {
+    DIAG.bump("asr.gated");
+    return "";
+  }
+  return cleaned;
 }
 
-async function runAsr(pcm) {
+async function runAsr(pcm, options = {}) {
   if (!asrSession || !asrFrontend) return null;
   const features = asrFrontend.computeFeatures(pcm);
   if (!features?.frames) return null;
@@ -193,7 +384,16 @@ async function runAsr(pcm) {
   DIAG.set("asr.frames", features.frames);
   DIAG.set("asr.dim", features.dim);
   DIAG.bump("asr.decodes");
-  return decodeSenseVoice(result.logits);
+  const totalOutFrames = result.logits.dims[result.logits.dims.length - 2];
+  const prefixFrames = Math.max(0, totalOutFrames - features.frames);
+  const skipFrames = options.emitOffsetSamples > 0
+    ? Math.round(options.emitOffsetSamples / LFR_FRAME_SAMPLES)
+    : 0;
+  return decodeSenseVoice(result.logits, {
+    prefixFrames,
+    skipFrames,
+    hotwordTrie: options.hotwordTrie || null
+  });
 }
 
 function createRingBuffer(capacity) {
@@ -323,7 +523,11 @@ function telemetryFor(current, audioSamples, captureEpoch, asrDurationMs) {
 function scheduleFirstTick(current) {
   const u = current.utterance;
   const scheduledAt = performance.now();
-  const minimum = () => u.anchorStart + MIN_UTTERANCE_SAMPLES - current.ring.total;
+  const readyAt = Math.max(
+    u.anchorStart + MIN_UTTERANCE_SAMPLES,
+    (u.emitFrom ?? u.anchorStart) + MIN_POST_SPLIT_NEW_SAMPLES
+  );
+  const minimum = () => readyAt - current.ring.total;
 
   const waitForMinimum = () => {
     // finishUtterance may have closed or replaced the line while waiting.
@@ -360,21 +564,23 @@ async function tickAnchoredUtterance(current) {
   if (!u || u.isDecoding || u.closed || !asrLoaded || session !== current || intentionalStop || current.stopping) return;
 
   const now = current.ring.total;
-  const windowLen = Math.min(now - u.anchorStart, MAX_UTTERANCE_SAMPLES);
+  const decodeStart = u.anchorStart;
+  const windowLen = Math.min(now - decodeStart, MAX_UTTERANCE_SAMPLES);
   if (windowLen < MIN_UTTERANCE_SAMPLES) return;
 
-  const pcm = current.ring.read(u.anchorStart, u.anchorStart + windowLen);
+  const pcm = current.ring.read(decodeStart, decodeStart + windowLen);
   if (!pcm || pcm.length < MIN_UTTERANCE_SAMPLES) return;
 
-  // Report the audio the decode actually covers. Once the 8 s cap is hit this
+  // Report the audio the decode actually covers. Once the cap is hit this
   // is behind ring.total, and using ring.total would name audio never decoded.
-  const decodedEnd = u.anchorStart + windowLen;
+  const decodedEnd = decodeStart + windowLen;
+  const emitOffsetSamples = Math.max(0, (u.emitFrom ?? decodeStart) - decodeStart);
 
   u.isDecoding = true;
   const tAsrStart = performance.now();
   const captureEpoch = Date.now();
   try {
-    const raw = await withAsrLock(current, () => runAsr(pcm));
+    const raw = await withAsrLock(current, () => runAsr(pcm, { emitOffsetSamples }));
     const tAsrEnd = performance.now();
     const asrDurationMs = Math.round((tAsrEnd - tAsrStart) * 10) / 10;
     const text = normalizeTranscript(raw);
@@ -434,84 +640,136 @@ async function tickAnchoredUtterance(current) {
   }
 }
 
-async function finishUtterance(current, endAbs) {
+function flushClosedUtterance(current, u, endAbs, options = {}) {
+  if (!u) return Promise.resolve();
+  u.closed = true;
+  clearDecodeTimer(u);
+
+  const isSplit = Boolean(options.isSplit);
+  const end = isSplit
+    ? Math.min(endAbs, u.anchorStart + MAX_UTTERANCE_SAMPLES, current.ring.total)
+    : Math.min(endAbs + TAIL_PAD_SAMPLES, u.anchorStart + MAX_UTTERANCE_SAMPLES, current.ring.total);
+
+  const emitFrom = Math.max(u.emitFrom ?? u.anchorStart, current.lastFlushEnd || 0);
+  if (end <= emitFrom) return Promise.resolve();
+
+  // Widen short windows backwards into real preceding audio in the ring (masked
+  // by emitFrom) so SenseVoice receives full acoustic context instead of zeros;
+  // only stream-start falls back to left zero-padding below.
+  let decodeStart = u.anchorStart;
+  if (end - decodeStart < MIN_UTTERANCE_SAMPLES) {
+    decodeStart = Math.max(0, end - MIN_UTTERANCE_SAMPLES);
+  }
+  current.lastFlushEnd = end;
+
+  let pcm = current.ring.read(decodeStart, end);
+  if (!pcm || pcm.length === 0) return Promise.resolve();
+
+  let padLeft = 0;
+  if (pcm.length < MIN_UTTERANCE_SAMPLES) {
+    padLeft = MIN_UTTERANCE_SAMPLES - pcm.length;
+    const padded = new Int16Array(MIN_UTTERANCE_SAMPLES);
+    padded.set(pcm, padLeft);
+    pcm = padded;
+  }
+
+  // ring.read clamps decodeStart to oldest retained sample; align offset with what was read
+  const actualStart = end - (pcm.length - padLeft);
+  const emitOffsetSamples = padLeft + Math.max(0, emitFrom - actualStart);
+
+  const tAsrStart = performance.now();
+  const captureEpoch = Date.now();
+  return (async () => {
+    try {
+      const raw = await withAsrLock(current, () =>
+        runAsr(pcm, {
+          emitOffsetSamples,
+          hotwordTrie: current.hotwordTrie || null
+        })
+      );
+      const tAsrEnd = performance.now();
+      const asrDurationMs = Math.round((tAsrEnd - tAsrStart) * 10) / 10;
+      const text = normalizeTranscript(raw);
+
+      if (session !== current || intentionalStop) return;
+
+      // An unusable/gated final decode must still emit FINAL so contentScript
+      // clears any prior interim tail instead of leaving a phantom line stuck.
+      const finalText = isUsableTranscript(text) ? text : u.committed;
+
+      await forwardTranscript(current.tabId, {
+        action: MSG.TRANSCRIPT_FINAL,
+        lineId: u.lineId,
+        text: finalText,
+        isFinal: true,
+        telemetry: telemetryFor(current, end, captureEpoch, asrDurationMs)
+      });
+    } catch (err) {
+      console.warn("[AnchoredCommitter] Final flush error:", err);
+    }
+  })();
+}
+
+function finishUtterance(current, endAbs) {
   const u = current.utterance;
   const segmenter = current.segmenter;
   segmenter.speechActive = false;
   segmenter.candidateStart = -1;
   segmenter.speechRun = 0;
   segmenter.silenceSamples = 0;
-  resetVadState();
-
-  if (u) u.closed = true;
-  clearDecodeTimer(u);
+  // Keep Silero LSTM state warm across pauses; only reset on stream start/stop.
   current.utterance = null;
-
-  if (!u) return;
-
-  const end = Math.min(
-    endAbs + TAIL_PAD_SAMPLES,
-    u.anchorStart + MAX_UTTERANCE_SAMPLES,
-    current.ring.total
-  );
-  let start = u.anchorStart;
-
-  // A short window is widened backwards into the ring so the encoder gets its
-  // receptive field, instead of dropping the utterance. `read()` already clamps
-  // the request to the oldest retained sample, so no separate bound is needed;
-  // anything still short (stream start) is padded on the left below.
-  if (end - start < MIN_UTTERANCE_SAMPLES) {
-    start = end - MIN_UTTERANCE_SAMPLES;
-  }
-
-  // Never widen back past the previous flush. That audio was already decoded
-  // into the previous line, and re-decoding it here would let this FINAL absorb
-  // and re-print the previous sentence. The left-pad below covers the shortfall.
-  if (current.lastFlushEnd) start = Math.max(start, current.lastFlushEnd);
-  if (start >= end) start = end - 1;
-  current.lastFlushEnd = end;
-
-  let pcm = current.ring.read(start, end);
-  if (!pcm || pcm.length === 0) return;
-
-  // If at the start of the stream and audio is still shorter than MIN_UTTERANCE_SAMPLES,
-  // pad with silence on the left to satisfy SenseVoice's receptive field.
-  if (pcm.length < MIN_UTTERANCE_SAMPLES) {
-    const padded = new Int16Array(MIN_UTTERANCE_SAMPLES);
-    padded.set(pcm, MIN_UTTERANCE_SAMPLES - pcm.length);
-    pcm = padded;
-  }
-
-  const tAsrStart = performance.now();
-  const captureEpoch = Date.now();
-  try {
-    const raw = await withAsrLock(current, () => runAsr(pcm));
-    const tAsrEnd = performance.now();
-    const asrDurationMs = Math.round((tAsrEnd - tAsrStart) * 10) / 10;
-    const text = normalizeTranscript(raw);
-
-    // The stop path awaits this flush, so `intentionalStop` is still false here.
-    // If it is set, the session is gone and this line must not reach the overlay.
-    if (session !== current || intentionalStop) return;
-
-    // An unusable final decode must still close the line. Emitting nothing would
-    // leave the last GROW/INTERIM text on the overlay indefinitely, in a slot
-    // that no later FINAL ever clears.
-    const finalText = isUsableTranscript(text) ? text : u.committed;
-
-    await forwardTranscript(current.tabId, {
-      action: MSG.TRANSCRIPT_FINAL,
-      lineId: u.lineId,
-      text: finalText,
-      isFinal: true,
-      telemetry: telemetryFor(current, end, captureEpoch, asrDurationMs)
-    });
-  } catch (err) {
-    console.warn("[AnchoredCommitter] Final flush error:", err);
-  }
+  return flushClosedUtterance(current, u, endAbs, { isSplit: false });
 }
 
-function handleVadFrame(current, probability, frameStart, frameEnd) {
+function findBestSplitFrame(vadFrames, minStart, maxEnd) {
+  let bestFrame = null;
+  let bestScore = Infinity;
+  for (let i = 0; i < vadFrames.length; i += 1) {
+    const f = vadFrames[i];
+    if (f.start < minStart || f.end > maxEnd) continue;
+    const score = f.prob * 10 + f.rms;
+    if (score < bestScore) {
+      bestScore = score;
+      bestFrame = f;
+    }
+  }
+  return bestFrame;
+}
+
+function splitUtteranceAtValley(current, frameEnd) {
+  const u = current.utterance;
+  const segmenter = current.segmenter;
+  if (!u) return;
+
+  const minSearch = u.emitFrom + SPLIT_SEARCH_MIN_SAMPLES;
+  const maxSearch = frameEnd - 2 * VAD_FRAME_SAMPLES;
+  const valley = findBestSplitFrame(u.vadFrames, minSearch, maxSearch);
+  const splitEnd = valley ? valley.end : frameEnd;
+
+  const remainingFrames = u.vadFrames.filter((f) => f.start >= splitEnd);
+  current.flushTask = flushClosedUtterance(current, u, splitEnd, { isSplit: true });
+
+  const nextDecodeStart = Math.max(0, splitEnd - SPLIT_LEFT_CONTEXT_SAMPLES);
+  segmenter.anchorStart = splitEnd;
+  segmenter.lastSpeechEnd = frameEnd;
+  segmenter.silenceSamples = 0;
+
+  current.utterance = {
+    lineId: Date.now() + "_" + Math.random().toString(36).slice(2, 6),
+    anchorStart: nextDecodeStart,
+    emitFrom: splitEnd,
+    committed: "",
+    prevText: "",
+    isDecoding: false,
+    closed: false,
+    timer: null,
+    vadFrames: remainingFrames
+  };
+  scheduleFirstTick(current);
+}
+
+function handleVadFrame(current, probability, rms, frameStart, frameEnd) {
   const segmenter = current.segmenter;
 
   if (!segmenter.speechActive) {
@@ -521,18 +779,23 @@ function handleVadFrame(current, probability, frameStart, frameEnd) {
       if (segmenter.speechRun >= VAD_SPEECH_ONSET_FRAMES) {
         segmenter.speechActive = true;
         segmenter.speechStart = segmenter.candidateStart;
-        segmenter.anchorStart = Math.max(0, segmenter.candidateStart - ANCHOR_PREROLL_SAMPLES);
+        const rawAnchor = Math.max(0, segmenter.candidateStart - ANCHOR_PREROLL_SAMPLES);
+        const emitFrom = Math.max(rawAnchor, current.lastFlushEnd || 0);
+        const decodeStart = Math.max(0, emitFrom - SPLIT_LEFT_CONTEXT_SAMPLES);
+        segmenter.anchorStart = emitFrom;
         segmenter.lastSpeechEnd = frameEnd;
         segmenter.silenceSamples = 0;
 
         current.utterance = {
           lineId: Date.now() + "_" + Math.random().toString(36).slice(2, 6),
-          anchorStart: segmenter.anchorStart,
+          anchorStart: rawAnchor >= emitFrom ? rawAnchor : decodeStart,
+          emitFrom,
           committed: "",
           prevText: "",
           isDecoding: false,
           closed: false,
-          timer: null
+          timer: null,
+          vadFrames: [{ start: frameStart, end: frameEnd, prob: probability, rms }]
         };
         scheduleFirstTick(current);
       }
@@ -543,6 +806,10 @@ function handleVadFrame(current, probability, frameStart, frameEnd) {
     return;
   }
 
+  if (current.utterance) {
+    current.utterance.vadFrames.push({ start: frameStart, end: frameEnd, prob: probability, rms });
+  }
+
   // Speech active: update end and silence
   if (probability >= VAD_CONTINUE_THRESHOLD) {
     segmenter.lastSpeechEnd = frameEnd;
@@ -551,13 +818,10 @@ function handleVadFrame(current, probability, frameStart, frameEnd) {
     segmenter.silenceSamples += VAD_FRAME_SAMPLES;
   }
 
-  if (
-    segmenter.silenceSamples >= END_SILENCE_SAMPLES ||
-    frameEnd - segmenter.anchorStart >= MAX_UTTERANCE_SAMPLES
-  ) {
-    // Track the flush so a stop arriving mid-decode can await it instead of
-    // racing it, and so its FINAL is not orphaned after the session is torn down.
+  if (segmenter.silenceSamples >= END_SILENCE_SAMPLES) {
     current.flushTask = finishUtterance(current, segmenter.lastSpeechEnd);
+  } else if (frameEnd - segmenter.anchorStart >= SPLIT_TRIGGER_SAMPLES) {
+    splitUtteranceAtValley(current, frameEnd);
   }
 }
 
@@ -625,13 +889,16 @@ async function processPcmChunk(current, arrayBuffer) {
   }
 
   while (current.vadPending.length >= VAD_FRAME_SAMPLES) {
-    const frame = current.vadPending.slice(0, VAD_FRAME_SAMPLES);
-    current.vadPending = current.vadPending.slice(VAD_FRAME_SAMPLES);
+    let sumSq = 0;
+    for (let i = 0; i < VAD_FRAME_SAMPLES; i += 1) {
+      const s = current.vadPending[i] / 32768;
+      vadFloatFrame[i] = s;
+      sumSq += s * s;
+    }
+    const rms = Math.sqrt(sumSq / VAD_FRAME_SAMPLES);
+    current.vadPending = current.vadPending.subarray(VAD_FRAME_SAMPLES);
 
-    const float32 = new Float32Array(VAD_FRAME_SAMPLES);
-    for (let i = 0; i < VAD_FRAME_SAMPLES; i += 1) float32[i] = frame[i] / 32768;
-
-    const probability = await runVad(float32);
+    const probability = await runVad(vadFloatFrame);
     if (session !== current || intentionalStop || current.stopping) return;
 
     DIAG.bump(probability >= VAD_SPEECH_THRESHOLD ? "vad.speechFrames" : "vad.idleFrames");
@@ -639,7 +906,7 @@ async function processPcmChunk(current, arrayBuffer) {
 
     const frameStart = current.vadAbs;
     current.vadAbs += VAD_FRAME_SAMPLES;
-    handleVadFrame(current, probability, frameStart, current.vadAbs);
+    handleVadFrame(current, probability, rms, frameStart, current.vadAbs);
   }
 }
 
@@ -826,6 +1093,7 @@ async function startSession(tabId, config) {
       // downstream latency metric truthful even under overload.
       streamStartEpoch: 0,
       asrChain: Promise.resolve(),
+      hotwordTrie: buildHotwordTrie(config?.hotwords),
       utterance: null,
       flushTask: null,
       lastFlushEnd: 0,
@@ -864,6 +1132,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if(msg?.target !== "offscreen") return false;
   if(msg.type===MSG.START) { startSession(msg.tabId, msg.config); sendResponse({ok:true}); return false; }
   if(msg.type===MSG.STOP) { stopSession(); sendResponse({ok:true}); return false; }
+  if(msg.type===MSG.APPLY_SETTINGS) {
+    if (session && msg.config && "hotwords" in msg.config) {
+      session.hotwordTrie = buildHotwordTrie(msg.config.hotwords);
+    }
+    sendResponse({ok:true});
+    return false;
+  }
   if(msg.type===MSG.GET_STATUS) { sendResponse(getStatus()); return false; }
   if(msg.type===MSG.GET_DIAGNOSTICS) {
     sendResponse({ok:true, snapshot: DIAG.snapshot(), status: getStatus()});

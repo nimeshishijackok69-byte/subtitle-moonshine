@@ -8,7 +8,8 @@ const DEFAULTS = {
   "overlay.lines": 3,
   "overlay.fontSize": 32,
   "overlay.opacity": 0.45,
-  "overlay.showInterim": true
+  "overlay.showInterim": true,
+  "overlay.hotwords": ""
 };
 
 const STATUS_LABELS = {
@@ -41,6 +42,7 @@ const els = {
   opacity: document.getElementById("opacity"),
   opacityValue: document.getElementById("opacityValue"),
   showInterim: document.getElementById("showInterim"),
+  hotwords: document.getElementById("hotwords"),
   start: document.getElementById("start"),
   stop: document.getElementById("stop"),
   copyDiagnostics: document.getElementById("copyDiagnostics"),
@@ -64,6 +66,7 @@ function getOverlayConfig() {
     fontSize: Number(els.fontSize.value),
     opacity: Number(els.opacity.value),
     showInterim: els.showInterim.checked,
+    hotwords: (els.hotwords?.value || "").trim(),
     chunkMs: 25
   };
 }
@@ -78,7 +81,8 @@ function getPersistedOverlaySettings() {
     "overlay.lines": config.lines,
     "overlay.fontSize": config.fontSize,
     "overlay.opacity": config.opacity,
-    "overlay.showInterim": config.showInterim
+    "overlay.showInterim": config.showInterim,
+    "overlay.hotwords": config.hotwords
   };
 }
 
@@ -456,6 +460,7 @@ async function load() {
   els.fontSize.value = values["overlay.fontSize"];
   els.opacity.value = values["overlay.opacity"];
   els.showInterim.checked = Boolean(values["overlay.showInterim"]);
+  if (els.hotwords) els.hotwords.value = values["overlay.hotwords"] || "";
 
   updateValueLabels();
   setStatus(STATE.IDLE);
@@ -467,7 +472,7 @@ async function load() {
 
 }
 
-for (const input of [els.lines, els.fontSize, els.opacity, els.showInterim]) {
+for (const input of [els.lines, els.fontSize, els.opacity, els.showInterim, els.hotwords].filter(Boolean)) {
   input.addEventListener("input", () => {
     applyOverlaySettingsToTab().catch((error) => setStatus(STATE.ERROR, error.message));
   });
