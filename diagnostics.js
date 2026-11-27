@@ -142,12 +142,16 @@
   }
 
   function snapshot() {
+    const timingsCopy = {};
+    for (const key of Object.keys(timings)) {
+      timingsCopy[key] = { ...timings[key] };
+    }
     return {
       reportVersion: REPORT_VERSION,
       bootId,
       capturedAt: new Date().toISOString(),
       fields: { ...fields },
-      timings: JSON.parse(JSON.stringify(timings)),
+      timings: timingsCopy,
       lastError: lastError ? { ...lastError } : null,
       events: events.map((e) => ({ ...e })),
       transcript: transcriptTail.map((e) => ({ ...e }))

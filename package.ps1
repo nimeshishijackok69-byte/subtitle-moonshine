@@ -71,16 +71,24 @@ $scriptRefs = @()
 foreach ($page in @("popup.html", "offscreen.html")) {
   $html = Get-Content (Join-Path $repo $page) -Raw
   foreach ($m in [regex]::Matches($html, '<script[^>]*\ssrc="([^"]+)"')) { $scriptRefs += $m.Groups[1].Value }
+  foreach ($m in [regex]::Matches($html, '<link[^>]*\shref="([^"]+)"')) { $scriptRefs += $m.Groups[1].Value }
 }
+$manifestObj = Get-Content (Join-Path $repo "manifest.json") -Raw | ConvertFrom-Json
+if ($manifestObj.action.default_popup) { $scriptRefs += $manifestObj.action.default_popup }
+if ($manifestObj.background.service_worker) { $scriptRefs += $manifestObj.background.service_worker }
 foreach ($js in @("service_worker.js", "offscreen.js", "popup.js")) {
   $text = Get-Content (Join-Path $repo $js) -Raw
   foreach ($m in [regex]::Matches($text, 'import\s+"([^"]+)"')) { $scriptRefs += $m.Groups[1].Value }
   foreach ($m in [regex]::Matches($text, 'getURL\(\s*"([^"]+)"')) { $scriptRefs += $m.Groups[1].Value }
+  foreach ($m in [regex]::Matches($text, 'SENSEVOICE_(?:MODEL|TOKENS|FRONTEND)\s*=\s*"([^"]+)"')) { $scriptRefs += $m.Groups[1].Value }
+  foreach ($m in [regex]::Matches($text, 'files:\s*\[([^\]]+)\]')) {
+    foreach ($f in [regex]::Matches($m.Groups[1].Value, '"([^"]+)"')) { $scriptRefs += $f.Groups[1].Value }
+  }
 }
 $allowNorm = @($files | ForEach-Object { $_ -replace '\\', '/' })
 # A trailing slash is a directory (wasmPaths), not a file; the artifact names it
 # resolves are covered by the ORT companion check above.
-$scriptRefs = @($scriptRefs | ForEach-Object { $_.TrimStart("./") } |
+$scriptRefs = @($scriptRefs | ForEach-Object { $_ -replace '^\./', '' } |
   Where-Object { $_ -notlike '*/' } | Sort-Object -Unique)
 foreach ($ref in $scriptRefs) {
   if ($allowNorm -notcontains $ref) { throw "$ref is loaded at runtime but missing from the allowlist" }

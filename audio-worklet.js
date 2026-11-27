@@ -60,21 +60,23 @@ class PcmCaptureProcessor extends AudioWorkletProcessor {
   }
 
   processBiquad(b, x) {
-    // Direct Form II Transposed; reset state on non-finite input/overflow so
-    // a single corrupted sample cannot permanently wedge the stream to silence.
+    // Direct Form II Transposed; reset state on non-finite input/overflow and
+    // flush subnormal values to 0 to prevent x86 denormal stalls in silence.
     if (!Number.isFinite(x)) {
       b.s1 = 0;
       b.s2 = 0;
       return 0;
     }
     const y = b.b0 * x + b.s1;
-    const s1 = b.b1 * x - b.a1 * y + b.s2;
-    const s2 = b.b2 * x - b.a2 * y;
+    let s1 = b.b1 * x - b.a1 * y + b.s2;
+    let s2 = b.b2 * x - b.a2 * y;
     if (!Number.isFinite(y) || !Number.isFinite(s1) || !Number.isFinite(s2)) {
       b.s1 = 0;
       b.s2 = 0;
       return 0;
     }
+    if (Math.abs(s1) < 1e-18) s1 = 0;
+    if (Math.abs(s2) < 1e-18) s2 = 0;
     b.s1 = s1;
     b.s2 = s2;
     return y;
@@ -92,21 +94,35 @@ class PcmCaptureProcessor extends AudioWorkletProcessor {
       return true;
     }
 
-    const frameLength = input[0].length;
+    const ch0 = input[0];
+    const frameLength = ch0.length;
     const channels = input.length;
+    const ch1 = channels === 2 ? input[1] : null;
+    const invChannels = 1 / channels;
+    const b1 = this.biquad1;
+    const b2 = this.biquad2;
 
     for (let i = 0; i < frameLength; i += 1) {
       let monoSample = 0;
-      for (let channel = 0; channel < channels; channel += 1) {
-        const s = input[channel][i];
-        if (Number.isFinite(s)) monoSample += s;
+      if (channels === 1) {
+        const s = ch0[i];
+        monoSample = Number.isFinite(s) ? s : 0;
+      } else if (channels === 2) {
+        const s0 = ch0[i];
+        const s1 = ch1[i];
+        monoSample = ((Number.isFinite(s0) ? s0 : 0) + (Number.isFinite(s1) ? s1 : 0)) * 0.5;
+      } else {
+        for (let channel = 0; channel < channels; channel += 1) {
+          const s = input[channel][i];
+          if (Number.isFinite(s)) monoSample += s;
+        }
+        monoSample *= invChannels;
       }
-      monoSample /= channels;
 
       // 4th-order anti-aliasing filter (bypassed when the source rate is already
       // at or below the 16 kHz target)
-      if (this.biquad1) {
-        monoSample = this.processBiquad(this.biquad2, this.processBiquad(this.biquad1, monoSample));
+      if (b1) {
+        monoSample = this.processBiquad(b2, this.processBiquad(b1, monoSample));
       }
 
       if (!this.hasLastSample) {
@@ -121,7 +137,7 @@ class PcmCaptureProcessor extends AudioWorkletProcessor {
         const interpolated = this.lastMonoSample + (monoSample - this.lastMonoSample) * fraction;
         const finite = Number.isFinite(interpolated) ? interpolated : 0;
         const clamped = Math.max(-1, Math.min(1, finite));
-        const pcmSample = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
+        const pcmSample = clamped < 0 ? Math.round(clamped * 0x8000) : Math.round(clamped * 0x7fff);
         this.pendingBuffer[this.pendingCount] = pcmSample;
         this.pendingCount += 1;
 

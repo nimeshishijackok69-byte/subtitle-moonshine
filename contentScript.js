@@ -54,6 +54,9 @@
     position: null,
     positionEpoch: 0,
     drag: null,
+    dragRaf: 0,
+    dragPendingX: 0,
+    dragPendingY: 0,
     activeLineId: null,
     activeLineText: "",
     interimTail: "",
@@ -62,10 +65,12 @@
     dismissed: false,
     pendingRender: false,
     controlsHideTimer: null,
-    lockedWidth: 0
+    boxSize: { width: 0, height: 0, top: 0 },
+    resizeObserver: null
   };
   if (!state.finalizedLineIds) state.finalizedLineIds = new Set();
   if (typeof state.positionEpoch !== "number") state.positionEpoch = 0;
+  if (!state.boxSize) state.boxSize = { width: 0, height: 0, top: 0 };
   globalThis[STATE_KEY] = state;
 
   function isValidPosition(pos) {
@@ -108,7 +113,13 @@
   const UNRENDERED_FULLSCREEN_TAGS = new Set(["VIDEO", "IFRAME", "IMG", "CANVAS", "OBJECT", "EMBED"]);
 
   function getFullscreenElement() {
-    return document.fullscreenElement || document.webkitFullscreenElement || null;
+    let el = document.fullscreenElement || document.webkitFullscreenElement || null;
+    while (el && el.shadowRoot) {
+      const inner = el.shadowRoot.fullscreenElement || el.shadowRoot.webkitFullscreenElement;
+      if (!inner || inner === el) break;
+      el = inner;
+    }
+    return el;
   }
 
   function getMountInfo() {
@@ -123,32 +134,44 @@
   }
 
   function ensureStyle() {
-    if (!OVERLAY_CSS || document.getElementById(STYLE_ID)) {
-      return;
-    }
+    if (!OVERLAY_CSS) return;
     if (state.root && typeof getComputedStyle === "function") {
       try {
-        if (getComputedStyle(state.root).position === "fixed") return;
+        const cs = getComputedStyle(state.root);
+        if (cs.getPropertyValue("--dg-styled")?.trim() === "1" && cs.position === "fixed") {
+          return;
+        }
       } catch {
         // Fall through to inline <style> injection when computed styles are unavailable.
       }
     }
 
+    const existing = document.getElementById(STYLE_ID);
+    if (existing) {
+      if (existing.textContent !== OVERLAY_CSS) {
+        existing.textContent = OVERLAY_CSS;
+      }
+      return;
+    }
+
     const style = document.createElement("style");
     style.id = STYLE_ID;
     style.textContent = OVERLAY_CSS;
-
     (document.head || document.documentElement).appendChild(style);
   }
 
-  function applyFullscreenLayer(usePopover) {
+  function applyFullscreenLayer(usePopover, promoteToTop = false) {
     if (!state.root) return;
     if (usePopover) {
       if (state.root.getAttribute("popover") !== "manual") {
         state.root.setAttribute("popover", "manual");
       }
       try {
-        if (typeof state.root.showPopover === "function" && !state.root.matches?.(":popover-open")) {
+        const isOpen = Boolean(state.root.matches?.(":popover-open"));
+        if (promoteToTop && isOpen && typeof state.root.hidePopover === "function") {
+          state.root.hidePopover();
+        }
+        if (typeof state.root.showPopover === "function" && (!isOpen || promoteToTop)) {
           state.root.showPopover();
         }
       } catch {
@@ -174,8 +197,29 @@
     if (parent && state.root.parentNode !== parent) {
       parent.appendChild(state.root);
     }
-    applyFullscreenLayer(usePopover);
+    applyFullscreenLayer(usePopover, usePopover);
     applyPosition();
+  }
+
+  function attachResizeObserver(root) {
+    if (state.resizeObserver) {
+      try { state.resizeObserver.disconnect(); } catch {}
+      state.resizeObserver = null;
+    }
+    if (typeof ResizeObserver !== "function" || !root) return;
+    const ro = new ResizeObserver((entries) => {
+      if (state.root !== root) return;
+      const entry = entries[0];
+      if (!entry) return;
+      const border = entry.borderBoxSize?.[0];
+      const w = border ? border.inlineSize : entry.contentRect.width;
+      const h = border ? border.blockSize : entry.contentRect.height;
+      state.boxSize.width = w;
+      state.boxSize.height = h;
+      applyPosition();
+    });
+    ro.observe(root);
+    state.resizeObserver = ro;
   }
 
   function ensureRoot() {
@@ -186,7 +230,7 @@
     }
 
     const { parent, usePopover } = getMountInfo();
-    if (state.root && parent?.contains(state.root)) {
+    if (state.root && parent && state.root.parentNode === parent) {
       applyFullscreenLayer(usePopover);
       return state.root;
     }
@@ -206,11 +250,13 @@
     root.setAttribute("lang", "ja");
     root.setAttribute("translate", "no");
     state.root = root;
+    state.boxSize = { width: 0, height: 0, top: 0 };
 
     buildToolbar(root);
     parent.appendChild(root);
     ensureStyle();
     applyFullscreenLayer(usePopover);
+    attachResizeObserver(root);
     rebuildLineNodes();
     applySettings(state.settings);
     return root;
@@ -222,14 +268,7 @@
       clearTimeout(state.controlsHideTimer);
       state.controlsHideTimer = null;
     }
-    if (!state.root.classList.contains("dg-controls-open")) {
-      const rect = state.root.getBoundingClientRect ? state.root.getBoundingClientRect() : null;
-      if (rect && rect.width > 0) {
-        state.lockedWidth = Math.max(state.lockedWidth || 0, Math.ceil(rect.width));
-        state.root.style.minWidth = `${state.lockedWidth}px`;
-      }
-      state.root.classList.add("dg-controls-open");
-    }
+    state.root.classList.add("dg-controls-open");
   }
 
   function scheduleCloseControls() {
@@ -239,8 +278,6 @@
       state.controlsHideTimer = null;
       if (state.drag || !state.root) return;
       state.root.classList.remove("dg-controls-open");
-      state.lockedWidth = 0;
-      state.root.style.minWidth = "";
     }, 500);
   }
 
@@ -268,10 +305,10 @@
     toolbar.addEventListener("pointerenter", openControls);
     toolbar.addEventListener("pointerleave", scheduleCloseControls);
 
-    // Allow dragging from the handle OR from the palette's outer background/padding
-    // (outside text lines so text selection for Yomitan still works normally).
+    // Allow dragging only from the dedicated handle or outer root padding so
+    // clicks in the gap between lines still allow text selection / Yomitan lookup.
     root.addEventListener("pointerdown", (event) => {
-      if (event.target === root || event.target === state.lineGroup) {
+      if (event.target === root) {
         startDrag(event);
       }
     });
@@ -329,6 +366,7 @@
 
   function hasActiveSelection() {
     if (!state.root || typeof window.getSelection !== "function") return false;
+    if (typeof document.hasFocus === "function" && !document.hasFocus()) return false;
     const sel = window.getSelection();
     if (!sel || sel.isCollapsed || !sel.rangeCount) return false;
     return state.root.contains(sel.anchorNode) || state.root.contains(sel.focusNode);
@@ -356,24 +394,25 @@
 
     const visible = rows.slice(-state.settings.lines);
     const isEmpty = visible.length === 0 && !state.drag;
+    if (isEmpty && state.root.classList.contains("dg-controls-open")) {
+      state.root.classList.remove("dg-controls-open");
+    }
     state.root.classList.toggle("dg-empty", isEmpty);
 
     for (let i = 0; i < state.finalNodes.length; i += 1) {
       const node = state.finalNodes[i];
       const row = visible[i];
-      node.style.display = row ? "" : "none";
+      const nextDisplay = row ? "" : "none";
+      if (node._dgDisplay !== nextDisplay) {
+        node.style.display = nextDisplay;
+        node._dgDisplay = nextDisplay;
+      }
       setRowContent(node, row);
     }
 
-    if (state.root.classList.contains("dg-controls-open") && state.root.getBoundingClientRect) {
-      const w = Math.ceil(state.root.getBoundingClientRect().width || 0);
-      if (w > state.lockedWidth) {
-        state.lockedWidth = w;
-        state.root.style.minWidth = `${w}px`;
-      }
+    if (typeof ResizeObserver !== "function" || state.position) {
+      applyPosition();
     }
-
-    applyPosition();
   }
 
   // Writes a row as [stable committed text][dimmed tail]. The tail span is
@@ -381,6 +420,11 @@
   function setRowContent(node, row) {
     const text = row ? row.text : "";
     const tail = row ? row.tail : "";
+    if (node._dgText === text && node._dgTail === tail && Boolean(node.lastElementChild) === Boolean(tail)) {
+      return;
+    }
+    node._dgText = text;
+    node._dgTail = tail;
 
     if (!tail) {
       // textContent includes the span's text, so a finalized line whose text
@@ -409,15 +453,25 @@
       state.finalLines.push(cleanText);
       state.finalLines = state.finalLines.slice(-state.settings.lines);
     }
-    state.interimTail = "";
     renderLines();
+  }
+
+  function getCachedBoxSize() {
+    if (typeof ResizeObserver === "function" && (state.boxSize.width > 0 || state.boxSize.height > 0)) {
+      return state.boxSize;
+    }
+    const rect = state.root.getBoundingClientRect ? state.root.getBoundingClientRect() : { width: 0, height: 0, top: 0 };
+    state.boxSize.width = rect.width || 0;
+    state.boxSize.height = rect.height || 0;
+    state.boxSize.top = rect.top || 0;
+    return state.boxSize;
   }
 
   function applyPosition() {
     if (!state.root) return;
     const vw = window.innerWidth || 1280;
     const vh = window.innerHeight || 720;
-    const rect = state.root.getBoundingClientRect ? state.root.getBoundingClientRect() : { width: 0, height: 0, top: vh * 0.9 };
+    const rect = getCachedBoxSize();
 
     if (!isValidPosition(state.position)) {
       state.position = null;
@@ -425,7 +479,8 @@
       state.root.style.top = "";
       state.root.style.bottom = "";
       state.root.style.transform = "";
-      state.root.classList.toggle("dg-toolbar-bottom", rect.height > 0 && rect.top >= 0 && rect.top < 40);
+      const estTop = rect.top || (vh * 0.94 - (rect.height || 0));
+      state.root.classList.toggle("dg-toolbar-bottom", rect.height > 0 && estTop >= 0 && estTop < 40);
       return;
     }
 
@@ -436,6 +491,7 @@
     const maxBottom = Math.max(8, vh - (rect.height || 0) - 8);
     const bottom = Math.max(8, Math.min(state.position.bottomPx, maxBottom));
 
+    state.position.bottomPx = bottom;
     state.root.style.left = `${centerX}px`;
     state.root.style.bottom = `${bottom}px`;
     state.root.style.top = "auto";
@@ -452,8 +508,32 @@
     applyPosition();
   }
 
+  function flushPendingDragFrame() {
+    if (state.dragRaf && typeof cancelAnimationFrame === "function") {
+      cancelAnimationFrame(state.dragRaf);
+    }
+    state.dragRaf = 0;
+    if (!state.drag) return;
+    const vw = window.innerWidth || 1280;
+    const vh = window.innerHeight || 720;
+    const nextCenterX = state.drag.centerX + (state.dragPendingX - state.drag.startX);
+    const nextBottom = state.drag.bottomPx - (state.dragPendingY - state.drag.startY);
+    const maxBottom = Math.max(8, vh - (state.drag.boxHeight || 0) - 8);
+
+    state.positionEpoch += 1;
+    state.position = {
+      centerXRatio: Math.max(0, Math.min(1, nextCenterX / Math.max(1, vw))),
+      bottomPx: Math.max(8, Math.min(nextBottom, maxBottom))
+    };
+    applyPosition();
+  }
+
   function cancelDrag(persist) {
     if (!state.drag) return;
+    if (state.dragRaf && typeof cancelAnimationFrame === "function") {
+      cancelAnimationFrame(state.dragRaf);
+    }
+    state.dragRaf = 0;
     const { pointerId, captureTarget } = state.drag;
     try {
       captureTarget?.releasePointerCapture?.(pointerId);
@@ -479,13 +559,16 @@
   }
 
   function startDrag(event) {
-    if (!state.root) return;
+    if (!state.root || state.drag) return;
     if (event.pointerType === "mouse" && event.button !== 0) return;
     event.preventDefault();
     event.stopPropagation();
     openControls();
 
     const rect = state.root.getBoundingClientRect();
+    state.boxSize.width = rect.width || 0;
+    state.boxSize.height = rect.height || 0;
+    state.boxSize.top = rect.top || 0;
     const vh = window.innerHeight || 720;
     const captureTarget = event.currentTarget || state.root;
     try {
@@ -500,8 +583,11 @@
       startX: event.clientX,
       startY: event.clientY,
       centerX: rect.left + rect.width / 2,
-      bottomPx: vh - rect.bottom
+      bottomPx: vh - rect.bottom,
+      boxHeight: rect.height || 0
     };
+    state.dragPendingX = event.clientX;
+    state.dragPendingY = event.clientY;
     state.root.classList.add("dg-dragging");
     state.root.classList.remove("dg-empty");
 
@@ -513,21 +599,20 @@
 
   function dragOverlay(event) {
     if (!state.drag || event.pointerId !== state.drag.pointerId) return;
-
-    const vw = window.innerWidth || 1280;
-    const nextCenterX = state.drag.centerX + (event.clientX - state.drag.startX);
-    const nextBottom = state.drag.bottomPx - (event.clientY - state.drag.startY);
-
-    state.positionEpoch += 1;
-    state.position = {
-      centerXRatio: Math.max(0, Math.min(1, nextCenterX / Math.max(1, vw))),
-      bottomPx: nextBottom
-    };
-    applyPosition();
+    state.dragPendingX = event.clientX;
+    state.dragPendingY = event.clientY;
+    if (typeof requestAnimationFrame === "function") {
+      if (!state.dragRaf) {
+        state.dragRaf = requestAnimationFrame(flushPendingDragFrame);
+      }
+    } else {
+      flushPendingDragFrame();
+    }
   }
 
   function stopDrag(event) {
     if (!state.drag || event.pointerId !== state.drag.pointerId) return;
+    flushPendingDragFrame();
     cancelDrag(true);
     scheduleCloseControls();
     renderLines();
@@ -535,11 +620,14 @@
 
   function removeOverlay() {
     cancelDrag(false);
+    if (state.resizeObserver) {
+      try { state.resizeObserver.disconnect(); } catch {}
+      state.resizeObserver = null;
+    }
     if (state.controlsHideTimer) {
       clearTimeout(state.controlsHideTimer);
       state.controlsHideTimer = null;
     }
-    state.lockedWidth = 0;
     if (state.root?.hasAttribute?.("popover")) {
       try {
         state.root.hidePopover?.();
@@ -559,7 +647,15 @@
 
   document.addEventListener("fullscreenchange", syncMountTarget);
   document.addEventListener("webkitfullscreenchange", syncMountTarget);
-  window.addEventListener("resize", applyPosition);
+  window.addEventListener("resize", () => {
+    state.boxSize = { width: 0, height: 0, top: 0 };
+    applyPosition();
+  });
+  window.addEventListener("blur", () => {
+    if (state.pendingRender) {
+      renderLines();
+    }
+  });
   document.addEventListener("selectionchange", () => {
     if (state.pendingRender && !hasActiveSelection()) {
       renderLines();
@@ -567,29 +663,47 @@
   });
 
   // ─── High-Precision Telemetry Store & Analysis Harness ──────────────
+  function sanitizeCsvCell(val) {
+    const str = String(val ?? "");
+    const safe = /^[=+\-@\t\r]/.test(str) ? `'${str}` : str;
+    return `"${safe.replace(/"/g, '""')}"`;
+  }
+
+  const TELEMETRY_CAP = 1000;
   const telemetry = {
-    records: [],
-    maxRecords: 1000,
+    buf: new Array(TELEMETRY_CAP),
+    head: 0,
+    count: 0,
     nextId: 1,
     add(record) {
       record.id = this.nextId;
       this.nextId += 1;
-      this.records.push(record);
-      if (this.records.length > this.maxRecords) {
-        this.records.shift();
+      const idx = (this.head + this.count) % TELEMETRY_CAP;
+      if (this.count < TELEMETRY_CAP) {
+        this.count += 1;
+      } else {
+        this.head = (this.head + 1) % TELEMETRY_CAP;
       }
+      this.buf[idx] = record;
     },
     reset() {
-      this.records = [];
+      this.buf = new Array(TELEMETRY_CAP);
+      this.head = 0;
+      this.count = 0;
       this.nextId = 1;
     },
     getLogs() {
-      return this.records;
+      const out = new Array(this.count);
+      for (let i = 0; i < this.count; i += 1) {
+        out[i] = this.buf[(this.head + i) % TELEMETRY_CAP];
+      }
+      return out;
     },
     getStats() {
-      if (!this.records.length) return { message: "No telemetry records captured yet." };
-      const finals = this.records.filter(r => r.isFinal);
-      const num = (arr) => arr.filter(n => typeof n === "number").sort((a, b) => a - b);
+      const records = this.getLogs();
+      if (!records.length) return { message: "No telemetry records captured yet." };
+      const finals = records.filter((r) => r.isFinal);
+      const num = (arr) => arr.filter((n) => typeof n === "number").sort((a, b) => a - b);
       const p = (arr, q) => arr[Math.floor(arr.length * q)] ?? 0;
       const bucket = (arr) => ({
         p50: p(arr, 0.5),
@@ -599,26 +713,24 @@
       });
       return {
         totalFinalLines: finals.length,
-        asrComputeMs: bucket(num(finals.map(r => r.asrDurationMs))),
-        // ASR start -> paint. Excludes how far behind real time the audio was.
-        endToEndLatencyMs: bucket(num(finals.map(r => r.e2eLatencyMs))),
-        // Backlog of the audio pipeline at decode time.
-        audioLagMs: bucket(num(finals.map(r => r.audioLagMs))),
-        // Sound uttered -> subtitle shown. The honest figure.
-        soundToSubtitleMs: bucket(num(finals.map(r => r.soundToSubtitleMs)))
+        asrComputeMs: bucket(num(finals.map((r) => r.asrDurationMs))),
+        endToEndLatencyMs: bucket(num(finals.map((r) => r.e2eLatencyMs))),
+        audioLagMs: bucket(num(finals.map((r) => r.audioLagMs))),
+        soundToSubtitleMs: bucket(num(finals.map((r) => r.soundToSubtitleMs)))
       };
     },
     exportCsv() {
-      if (!this.records.length) return "";
+      const records = this.getLogs();
+      if (!records.length) return "";
       const headers = [
         "Index", "WallClock", "Text", "Action", "IsFinal", "AudioSeconds",
         "AsrDurationMs", "E2ELatencyMs", "AudioLagMs", "SoundToSubtitleMs"
       ];
-      const rows = this.records.map(r => [
+      const rows = records.map((r) => [
         r.id,
-        `"${r.wallClock}"`,
-        `"${(r.text || "").replace(/"/g, '""')}"`,
-        r.action,
+        sanitizeCsvCell(r.wallClock),
+        sanitizeCsvCell(r.text || ""),
+        sanitizeCsvCell(r.action),
         r.isFinal,
         r.audioSeconds,
         r.asrDurationMs,
@@ -626,7 +738,7 @@
         r.audioLagMs,
         r.soundToSubtitleMs
       ]);
-      return [headers.join(","), ...rows.map(r => r.join(","))].join("\n");
+      return [headers.join(","), ...rows.map((r) => r.join(","))].join("\n");
     },
     downloadCsv(filename = "subtitle_live_telemetry.csv") {
       const csv = this.exportCsv();
@@ -641,10 +753,15 @@
       a.download = filename;
       a.click();
       setTimeout(() => URL.revokeObjectURL(url), 1000);
-      console.log(`[Telemetry] Exported ${this.records.length} records to ${filename}`);
+      console.log(`[Telemetry] Exported ${this.count} records to ${filename}`);
     }
   };
-  window.__dgTelemetry = telemetry;
+  Object.defineProperty(window, "__dgTelemetry", {
+    value: telemetry,
+    writable: false,
+    configurable: true,
+    enumerable: true
+  });
   // No page-main-world bridge on purpose: an inline page script exposing
   // getStats/downloadCsv is readable by every page script, so it would hand
   // pages a page-triggered download capability into the user's Downloads
@@ -698,12 +815,14 @@
       state.interimTail = "";
       state.finalizedLineId = null;
       state.finalizedLineIds.clear();
-      state.lockedWidth = 0;
-      if (state.root) state.root.style.minWidth = "";
       state.dismissed = false;
       telemetry.reset();
       ensureRoot();
-      renderLines();
+      if (message.config) {
+        applySettings(message.config);
+      } else {
+        renderLines();
+      }
       return;
     }
 
@@ -745,9 +864,11 @@
             state.finalizedLineIds.delete(oldest);
           }
         }
-        state.activeLineId = null;
-        state.activeLineText = "";
-        state.interimTail = "";
+        if (!state.activeLineId || !message.lineId || state.activeLineId === lineId) {
+          state.activeLineId = null;
+          state.activeLineText = "";
+          state.interimTail = "";
+        }
         commitFinal(text);
       } else {
         console.warn("[Overlay] unknown transcript action:", action);

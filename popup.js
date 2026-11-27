@@ -52,7 +52,10 @@ const els = {
 };
 
 let overlaySaveTimer = null;
+let settingsSendTimer = null;
 let hotwordsApplyTimer = null;
+let userInitiatedStart = false;
+let userEditedSettings = false;
 
 function storageGet(keys) {
   return chrome.storage.local.get(keys);
@@ -112,6 +115,16 @@ function setStatus(state, detail = "", options = {}) {
   updateStartState();
 }
 
+function reportPopupError(error) {
+  const curState = els.statusDot.dataset.state || STATE.IDLE;
+  const msg = error?.message || String(error || "Unknown error");
+  if (ACTIVE_SESSION_STATES.has(curState)) {
+    setStatus(curState, msg, { isError: true });
+    return;
+  }
+  setStatus(STATE.ERROR, msg);
+}
+
 async function getActiveTabId() {
   const [tab] = await chrome.tabs.query({
     active: true,
@@ -133,22 +146,11 @@ function scheduleOverlaySettingsSave() {
   window.clearTimeout(overlaySaveTimer);
   overlaySaveTimer = window.setTimeout(() => {
     overlaySaveTimer = null;
-    persistOverlaySettings().catch((error) => setStatus(STATE.ERROR, error.message));
+    persistOverlaySettings().catch(reportPopupError);
   }, 200);
 }
 
-function flushPendingSettingsSave() {
-  if (overlaySaveTimer) {
-    window.clearTimeout(overlaySaveTimer);
-    overlaySaveTimer = null;
-    persistOverlaySettings().catch(() => {});
-  }
-}
-
-async function applyOverlaySettingsToTab() {
-  updateValueLabels();
-  scheduleOverlaySettingsSave();
-
+async function sendApplySettingsToRuntime() {
   try {
     const tabId = await getActiveTabId();
     await chrome.runtime.sendMessage({
@@ -159,6 +161,40 @@ async function applyOverlaySettingsToTab() {
   } catch {
     // The overlay may not be present before the first session.
   }
+}
+
+function flushPendingSettingsSave() {
+  const hadStoragePending = Boolean(overlaySaveTimer);
+  const hadHotwordsPending = Boolean(hotwordsApplyTimer);
+  const hadSettingsSend = Boolean(settingsSendTimer);
+  if (overlaySaveTimer) {
+    window.clearTimeout(overlaySaveTimer);
+    overlaySaveTimer = null;
+  }
+  if (hotwordsApplyTimer) {
+    window.clearTimeout(hotwordsApplyTimer);
+    hotwordsApplyTimer = null;
+  }
+  if (settingsSendTimer) {
+    window.clearTimeout(settingsSendTimer);
+    settingsSendTimer = null;
+  }
+  if (hadStoragePending || hadHotwordsPending) {
+    persistOverlaySettings().catch(() => {});
+  }
+  if (hadHotwordsPending || hadSettingsSend) {
+    sendApplySettingsToRuntime().catch(() => {});
+  }
+}
+
+function applyOverlaySettingsToTab() {
+  updateValueLabels();
+  scheduleOverlaySettingsSave();
+  window.clearTimeout(settingsSendTimer);
+  settingsSendTimer = window.setTimeout(() => {
+    settingsSendTimer = null;
+    sendApplySettingsToRuntime().catch(() => {});
+  }, 60);
 }
 
 async function startSession() {
@@ -236,8 +272,12 @@ async function probeBrowserVersion() {
 
 function describePlatform() {
   const data = navigator.userAgentData;
+  const ua = navigator.userAgent || "";
   if (data?.platform) {
-    return `${data.platform} ${navigator.userAgent.includes("x86") ? "x86_64" : ""}`.trim();
+    const arch = /x86_64|x64|Win64|WOW64|amd64|x86/i.test(ua)
+      ? "x86_64"
+      : (/arm64|aarch64/i.test(ua) ? "arm64" : "");
+    return `${data.platform} ${arch}`.trim();
   }
   return navigator.platform || "unknown";
 }
@@ -437,12 +477,28 @@ async function buildDiagnosticReport() {
 }
 
 async function copyDiagnostics() {
-  const report = await buildDiagnosticReport();
+  const reportPromise = buildDiagnosticReport();
+  // Prefer ClipboardItem synchronously in the click turn so Chrome keeps user
+  // activation alive while awaiting async diagnostic probes.
+  if (typeof ClipboardItem !== "undefined" && navigator.clipboard?.write) {
+    try {
+      let resolvedLen = 0;
+      const item = new ClipboardItem({
+        "text/plain": reportPromise.then((text) => {
+          resolvedLen = text.length;
+          return new Blob([text], { type: "text/plain" });
+        })
+      });
+      await navigator.clipboard.write([item]);
+      if (resolvedLen > 0) return resolvedLen;
+    } catch {
+      // Fall through to resolved writeText / execCommand fallback.
+    }
+  }
+  const report = await reportPromise;
   try {
     await navigator.clipboard.writeText(report);
   } catch {
-    // writeText rejects when the document lost focus between click and copy;
-    // the textarea path still works because it runs inside the same turn.
     const area = document.createElement("textarea");
     area.value = report;
     area.setAttribute("readonly", "");
@@ -462,16 +518,20 @@ async function load() {
     ...DEFAULTS,
     ...(await storageGet(Object.keys(DEFAULTS)))
   };
-  els.lines.value = values["overlay.lines"];
-  els.fontSize.value = values["overlay.fontSize"];
-  els.opacity.value = values["overlay.opacity"];
-  els.showInterim.checked = Boolean(values["overlay.showInterim"]);
-  if (els.hotwords) els.hotwords.value = values["overlay.hotwords"] || "";
-
-  updateValueLabels();
-  setStatus(STATE.IDLE);
+  if (!userEditedSettings) {
+    els.lines.value = values["overlay.lines"];
+    els.fontSize.value = values["overlay.fontSize"];
+    els.opacity.value = values["overlay.opacity"];
+    els.showInterim.checked = Boolean(values["overlay.showInterim"]);
+    if (els.hotwords) els.hotwords.value = values["overlay.hotwords"] || "";
+    updateValueLabels();
+  }
+  if (!userInitiatedStart) {
+    setStatus(STATE.IDLE);
+  }
 
   const status = await chrome.runtime.sendMessage({ type: MSG.GET_STATUS });
+  if (userInitiatedStart) return;
   if (status?.ok) {
     const state = status.state || STATE.IDLE;
     if (state === STATE.ERROR) {
@@ -488,22 +548,23 @@ async function load() {
       setStatus(state);
     }
   }
-
 }
 
 for (const input of [els.lines, els.fontSize, els.opacity, els.showInterim]) {
   input.addEventListener("input", () => {
-    applyOverlaySettingsToTab().catch((error) => setStatus(STATE.ERROR, error.message));
+    userEditedSettings = true;
+    applyOverlaySettingsToTab();
   });
 }
 
 if (els.hotwords) {
   els.hotwords.addEventListener("input", () => {
-    persistOverlaySettings().catch(() => {});
+    userEditedSettings = true;
+    scheduleOverlaySettingsSave();
     window.clearTimeout(hotwordsApplyTimer);
     hotwordsApplyTimer = window.setTimeout(() => {
       hotwordsApplyTimer = null;
-      applyOverlaySettingsToTab().catch((error) => setStatus(STATE.ERROR, error.message));
+      sendApplySettingsToRuntime().catch(reportPopupError);
     }, 300);
   });
 }
@@ -514,19 +575,22 @@ document.addEventListener("visibilitychange", () => {
 });
 
 if (els.resetOverlay) {
+  els.resetOverlay.dataset.defaultLabel = els.resetOverlay.textContent;
   els.resetOverlay.addEventListener("click", async () => {
     try {
       const tabId = await getActiveTabId();
-      await chrome.runtime.sendMessage({ type: MSG.RESET_OVERLAY, tabId });
-      const label = els.resetOverlay.textContent;
+      const res = await chrome.runtime.sendMessage({ type: MSG.RESET_OVERLAY, tabId });
+      if (res && res.ok === false) {
+        throw new Error(res.error || "Unable to reset overlay.");
+      }
       els.resetOverlay.textContent = "Reset ✓";
       els.resetOverlay.classList.add("saved");
       window.setTimeout(() => {
-        els.resetOverlay.textContent = label;
+        els.resetOverlay.textContent = els.resetOverlay.dataset.defaultLabel;
         els.resetOverlay.classList.remove("saved");
       }, 1200);
     } catch (error) {
-      setStatus(STATE.ERROR, error.message);
+      reportPopupError(error);
     }
   });
 }
@@ -535,8 +599,10 @@ els.start.addEventListener("click", () => {
   // Disable synchronously in the gesture turn: the rest of the click flow
   // awaits storage/tab IPC calls before the first status update, leaving a
   // double-click window that would race two concurrent sessions.
+  userInitiatedStart = true;
   els.start.disabled = true;
   startSession().catch(async (error) => {
+    userInitiatedStart = false;
     const live = await chrome.runtime.sendMessage({ type: MSG.GET_STATUS }).catch(() => null);
     if (live?.ok && ACTIVE_SESSION_STATES.has(live.state)) {
       setStatus(live.state, error.message, { isError: true });
@@ -547,12 +613,12 @@ els.start.addEventListener("click", () => {
 });
 
 els.stop.addEventListener("click", () => {
-  stopSession().catch((error) => setStatus(STATE.ERROR, error.message));
+  stopSession().catch(reportPopupError);
 });
 
+els.copyDiagnostics.dataset.defaultLabel = els.copyDiagnostics.textContent;
 els.copyDiagnostics.addEventListener("click", async () => {
   const button = els.copyDiagnostics;
-  const label = button.textContent;
   button.disabled = true;
   try {
     const chars = await copyDiagnostics();
@@ -560,10 +626,10 @@ els.copyDiagnostics.addEventListener("click", async () => {
     button.classList.add("copied");
   } catch (error) {
     button.textContent = "Copy failed";
-    setStatus(STATE.ERROR, error.message);
+    reportPopupError(error);
   }
   window.setTimeout(() => {
-    button.textContent = label;
+    button.textContent = button.dataset.defaultLabel;
     button.classList.remove("copied");
     button.disabled = false;
   }, 1800);
@@ -571,15 +637,17 @@ els.copyDiagnostics.addEventListener("click", async () => {
 
 chrome.runtime.onMessage.addListener((message) => {
   if (message?.type === MSG.STATE) {
+    if (message.state === STATE.IDLE || message.state === STATE.ERROR) {
+      userInitiatedStart = false;
+    }
     setStatus(message.state);
   }
 
   if (message?.type === MSG.ERROR) {
-    // The code is the stable, searchable token; the message is free text that
-    // changes between Chrome versions. Lead with the code.
+    userInitiatedStart = false;
     const detail = message.code ? `[${message.code}] ${message.message}` : message.message;
     setStatus(STATE.ERROR, detail);
   }
 });
 
-load().catch((error) => setStatus(STATE.ERROR, error.message));
+load().catch(reportPopupError);

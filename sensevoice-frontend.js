@@ -5,6 +5,7 @@
   const FRAME_LENGTH = 400;
   const FRAME_SHIFT = 160;
   const FFT_SIZE = 512;
+  const HALF_FFT = FFT_SIZE >> 1; // 256-pt complex FFT for 512-pt real sequence
   const NUM_BINS = 80;
   const LOW_FREQ = 20;
   const HIGH_FREQ = 8000;
@@ -17,10 +18,10 @@
     return MEL_SCALE * Math.log(1 + f / 700);
   }
 
-  function buildBitReverse() {
-    const table = new Uint16Array(FFT_SIZE);
-    const bits = Math.log2(FFT_SIZE);
-    for (let i = 0; i < FFT_SIZE; i += 1) {
+  function buildBitReverse(size) {
+    const table = new Uint16Array(size);
+    const bits = Math.log2(size);
+    for (let i = 0; i < size; i += 1) {
       let value = i;
       let reversed = 0;
       for (let bit = 0; bit < bits; bit += 1) {
@@ -32,11 +33,12 @@
     return table;
   }
 
-  function buildTwiddles() {
-    const cos = new Float64Array(FFT_SIZE / 2);
-    const sin = new Float64Array(FFT_SIZE / 2);
-    for (let i = 0; i < FFT_SIZE / 2; i += 1) {
-      const angle = (-2 * Math.PI * i) / FFT_SIZE;
+  function buildTwiddles(size) {
+    const half = size >> 1;
+    const cos = new Float64Array(half);
+    const sin = new Float64Array(half);
+    for (let i = 0; i < half; i += 1) {
+      const angle = (-2 * Math.PI * i) / size;
       cos[i] = Math.cos(angle);
       sin[i] = Math.sin(angle);
     }
@@ -51,18 +53,24 @@
       points[i] = lowMel + ((highMel - lowMel) * i) / (NUM_BINS + 1);
     }
 
-    const binMel = new Float64Array(FFT_SIZE / 2 + 1);
+    const binMel = new Float64Array(HALF_FFT + 1);
     for (let i = 0; i < binMel.length; i += 1) {
       binMel[i] = mel((i * SAMPLE_RATE) / FFT_SIZE);
     }
 
-    const weights = [];
+    const melStart = new Uint16Array(NUM_BINS);
+    const melEnd = new Uint16Array(NUM_BINS);
+    const melWOff = new Uint16Array(NUM_BINS);
+    const flatWeights = [];
+
     for (let filter = 1; filter <= NUM_BINS; filter += 1) {
       const left = points[filter - 1];
       const center = points[filter];
       const right = points[filter + 1];
-      const index = [];
-      const value = [];
+      const fIdx = filter - 1;
+      let start = -1;
+      let end = 0;
+      melWOff[fIdx] = flatWeights.length;
       for (let bin = 0; bin < binMel.length; bin += 1) {
         const m = binMel[bin];
         let weight = 0;
@@ -72,13 +80,21 @@
           weight = (right - m) / (right - center);
         }
         if (weight > 0) {
-          index.push(bin);
-          value.push(weight);
+          if (start === -1) start = bin;
+          end = bin + 1;
+          flatWeights.push(weight);
         }
       }
-      weights.push({ index: Uint16Array.from(index), value: Float64Array.from(value) });
+      melStart[fIdx] = start === -1 ? 0 : start;
+      melEnd[fIdx] = end;
     }
-    return weights;
+
+    return {
+      melStart,
+      melEnd,
+      melWOff,
+      melWeights: Float64Array.from(flatWeights)
+    };
   }
 
   function buildWindow() {
@@ -95,20 +111,28 @@
       this.invStd = Float32Array.from(config.invStd);
       this.language = config.language ?? 11;
       this.textNorm = config.textNorm ?? 14;
-      this.bitReverse = buildBitReverse();
-      this.twiddles = buildTwiddles();
-      this.melFilters = buildMelFilters();
+      this.bitReverse = buildBitReverse(HALF_FFT);
+      this.twiddles256 = buildTwiddles(HALF_FFT);
+      this.unpackTwiddles = buildTwiddles(FFT_SIZE);
+      this.mel = buildMelFilters();
       this.window = buildWindow();
-      this.re = new Float64Array(FFT_SIZE);
-      this.im = new Float64Array(FFT_SIZE);
-      this.power = new Float64Array(FFT_SIZE / 2 + 1);
-      this.frame = new Float64Array(FRAME_LENGTH);
+      this.re = new Float64Array(HALF_FFT);
+      this.im = new Float64Array(HALF_FFT);
+      this.power = new Float64Array(HALF_FFT + 1);
       this.fbankBuf = new Float32Array(0);
-      this.lfrSourceBuf = new Float32Array(0);
       this.lfrOutBuf = new Float32Array(0);
+      this.cacheKey = null;
+      this.cachedFrames = 0;
+      this.cachedSampleLen = 0;
     }
 
-    computeFeatures(samples) {
+    invalidateCache() {
+      this.cacheKey = null;
+      this.cachedFrames = 0;
+      this.cachedSampleLen = 0;
+    }
+
+    computeFeatures(samples, cacheKey = null) {
       if (!samples || samples.length < FRAME_LENGTH) return null;
 
       const frameCount = 1 + Math.floor((samples.length - FRAME_LENGTH) / FRAME_SHIFT);
@@ -116,56 +140,92 @@
 
       const fbankLen = frameCount * NUM_BINS;
       if (this.fbankBuf.length < fbankLen) {
-        this.fbankBuf = new Float32Array(fbankLen);
+        const grown = new Float32Array(fbankLen);
+        if (this.cachedFrames > 0) {
+          grown.set(this.fbankBuf.subarray(0, this.cachedFrames * NUM_BINS));
+        }
+        this.fbankBuf = grown;
       }
       const fbank = this.fbankBuf.subarray(0, fbankLen);
-      for (let frameIndex = 0; frameIndex < frameCount; frameIndex += 1) {
+
+      let startFrame = 0;
+      if (
+        cacheKey !== null &&
+        cacheKey === this.cacheKey &&
+        samples.length >= this.cachedSampleLen &&
+        this.cachedFrames > 0 &&
+        this.cachedFrames <= frameCount
+      ) {
+        startFrame = this.cachedFrames;
+      }
+
+      const win = this.window;
+      const re = this.re;
+      const im = this.im;
+      const power = this.power;
+      const { melStart, melEnd, melWOff, melWeights } = this.mel;
+      const oneMinusPre = 1 - PREEMPHASIS;
+
+      for (let frameIndex = startFrame; frameIndex < frameCount; frameIndex += 1) {
         const offset = frameIndex * FRAME_SHIFT;
         let mean = 0;
         for (let i = 0; i < FRAME_LENGTH; i += 1) {
-          const value = samples[offset + i];
-          this.frame[i] = value;
-          mean += value;
+          mean += samples[offset + i];
         }
         mean /= FRAME_LENGTH;
-        for (let i = 0; i < FRAME_LENGTH; i += 1) this.frame[i] -= mean;
+        const dcBias = oneMinusPre * mean;
 
-        for (let i = FRAME_LENGTH - 1; i > 0; i -= 1) {
-          this.frame[i] -= PREEMPHASIS * this.frame[i - 1];
-        }
-        this.frame[0] -= PREEMPHASIS * this.frame[0];
+        // Fused DC removal, pre-emphasis, Hamming window, and real-to-complex
+        // 256-pt packing: re[n] = frame[2n], im[n] = frame[2n+1].
+        re.fill(0);
+        im.fill(0);
+        let prev = samples[offset];
+        re[0] = (prev * oneMinusPre - dcBias) * win[0];
+        let cur = samples[offset + 1];
+        im[0] = (cur - PREEMPHASIS * prev - dcBias) * win[1];
+        prev = cur;
 
-        this.re.fill(0);
-        this.im.fill(0);
-        for (let i = 0; i < FRAME_LENGTH; i += 1) {
-          this.re[i] = this.frame[i] * this.window[i];
+        for (let i = 2; i < FRAME_LENGTH; i += 2) {
+          const s0 = samples[offset + i];
+          const w0 = (s0 - PREEMPHASIS * prev - dcBias) * win[i];
+          const s1 = samples[offset + i + 1];
+          const w1 = (s1 - PREEMPHASIS * s0 - dcBias) * win[i + 1];
+          prev = s1;
+          const idx = i >> 1;
+          re[idx] = w0;
+          im[idx] = w1;
         }
 
-        this.fft();
-        const power = this.power;
-        for (let i = 0; i < power.length; i += 1) {
-          power[i] = this.re[i] * this.re[i] + this.im[i] * this.im[i];
-        }
+        this.fft256();
+        this.computeRealSpectrumPower();
 
         const base = frameIndex * NUM_BINS;
         for (let filter = 0; filter < NUM_BINS; filter += 1) {
-          const spec = this.melFilters[filter];
+          const sBin = melStart[filter];
+          const eBin = melEnd[filter];
+          let w = melWOff[filter];
           let energy = 0;
-          for (let i = 0; i < spec.index.length; i += 1) {
-            energy += power[spec.index[i]] * spec.value[i];
+          for (let bin = sBin; bin < eBin; bin += 1, w += 1) {
+            energy += power[bin] * melWeights[w];
           }
-          fbank[base + filter] = Math.log(Math.max(energy, 1.1920929e-7));
+          fbank[base + filter] = Math.log(energy > 1.1920929e-7 ? energy : 1.1920929e-7);
         }
       }
 
-      return this.applyLfr(fbank, frameCount);
+      if (cacheKey !== null) {
+        this.cacheKey = cacheKey;
+        this.cachedFrames = frameCount;
+        this.cachedSampleLen = samples.length;
+      }
+
+      return this.applyLfrDirect(fbank, frameCount);
     }
 
-    fft() {
+    fft256() {
       const re = this.re;
       const im = this.im;
       const reverse = this.bitReverse;
-      for (let i = 0; i < FFT_SIZE; i += 1) {
+      for (let i = 0; i < HALF_FFT; i += 1) {
         const j = reverse[i];
         if (j > i) {
           const tr = re[i];
@@ -177,18 +237,19 @@
         }
       }
 
-      const cos = this.twiddles.cos;
-      const sin = this.twiddles.sin;
-      for (let size = 2; size <= FFT_SIZE; size <<= 1) {
+      const cos = this.twiddles256.cos;
+      const sin = this.twiddles256.sin;
+      for (let size = 2; size <= HALF_FFT; size <<= 1) {
         const half = size >> 1;
-        const step = FFT_SIZE / size;
-        for (let start = 0; start < FFT_SIZE; start += size) {
-          for (let j = 0; j < half; j += 1) {
-            const k = j * step;
-            const a = start + j;
+        const step = HALF_FFT / size;
+        for (let j = 0; j < half; j += 1) {
+          const k = j * step;
+          const ck = cos[k];
+          const sk = sin[k];
+          for (let a = j; a < HALF_FFT; a += size) {
             const b = a + half;
-            const tr = re[b] * cos[k] - im[b] * sin[k];
-            const ti = re[b] * sin[k] + im[b] * cos[k];
+            const tr = re[b] * ck - im[b] * sk;
+            const ti = re[b] * sk + im[b] * ck;
             re[b] = re[a] - tr;
             im[b] = im[a] - ti;
             re[a] += tr;
@@ -198,52 +259,76 @@
       }
     }
 
-    applyLfr(fbank, frameCount) {
-      const leftPad = Math.floor((LFR_M - 1) / 2);
+    computeRealSpectrumPower() {
+      const re = this.re;
+      const im = this.im;
+      const power = this.power;
+      const cos = this.unpackTwiddles.cos;
+      const sin = this.unpackTwiddles.sin;
+
+      // DC (k = 0) and Nyquist (k = 256)
+      const dc = re[0] + im[0];
+      const nyq = re[0] - im[0];
+      power[0] = dc * dc;
+      power[HALF_FFT] = nyq * nyq;
+
+      // Conjugate-symmetry unpack for bins 1..255
+      const halfBins = HALF_FFT >> 1; // 128
+      for (let k = 1; k < halfBins; k += 1) {
+        const nk = HALF_FFT - k;
+        const rk = re[k];
+        const ik = im[k];
+        const rnk = re[nk];
+        const ink = im[nk];
+
+        const evenRe = 0.5 * (rk + rnk);
+        const evenIm = 0.5 * (ik - ink);
+        const oddRe = 0.5 * (ik + ink);
+        const oddIm = 0.5 * (rnk - rk);
+
+        const ck = cos[k];
+        const sk = sin[k];
+        const twRe = oddRe * ck - oddIm * sk;
+        const twIm = oddRe * sk + oddIm * ck;
+
+        const xkRe = evenRe + twRe;
+        const xkIm = evenIm + twIm;
+        power[k] = xkRe * xkRe + xkIm * xkIm;
+
+        const xnkRe = evenRe - twRe;
+        const xnkIm = twIm - evenIm;
+        power[nk] = xnkRe * xnkRe + xnkIm * xnkIm;
+      }
+
+      const midRe = re[halfBins];
+      const midIm = im[halfBins];
+      power[halfBins] = midRe * midRe + midIm * midIm;
+    }
+
+    applyLfrDirect(fbank, frameCount) {
+      const leftPad = (LFR_M - 1) >> 1; // 3
       const lfrFrames = Math.ceil(frameCount / LFR_N);
-      const paddedCount = frameCount + leftPad;
-      const lastIndex = Math.floor((paddedCount - LFR_M) / LFR_N) + 1;
-      let padding = LFR_M - (paddedCount - lastIndex * LFR_N);
-      let extra = 0;
-      if (padding > 0) {
-        extra = Math.floor(
-          ((2 * LFR_M - 2 * paddedCount + (lfrFrames - 1 + lastIndex) * LFR_N) / 2) *
-            (lfrFrames - lastIndex)
-        );
-      }
-
-      const sourceFrames = paddedCount + Math.max(0, extra);
-      const sourceLen = sourceFrames * NUM_BINS;
-      if (this.lfrSourceBuf.length < sourceLen) {
-        this.lfrSourceBuf = new Float32Array(sourceLen);
-      }
-      const source = this.lfrSourceBuf.subarray(0, sourceLen);
-      for (let i = 0; i < leftPad; i += 1) {
-        source.set(fbank.subarray(0, NUM_BINS), i * NUM_BINS);
-      }
-      source.set(fbank, leftPad * NUM_BINS);
-      for (let i = 0; i < extra; i += 1) {
-        const src = (paddedCount - 1) * NUM_BINS;
-        const dst = (paddedCount + i) * NUM_BINS;
-        source.set(source.subarray(src, src + NUM_BINS), dst);
-      }
-
       const dim = NUM_BINS * LFR_M;
       const outLen = lfrFrames * dim;
       if (this.lfrOutBuf.length < outLen) {
         this.lfrOutBuf = new Float32Array(outLen);
       }
       const out = this.lfrOutBuf.subarray(0, outLen);
+      const negMean = this.negMean;
+      const invStd = this.invStd;
+      const maxFrame = frameCount - 1;
+
       for (let t = 0; t < lfrFrames; t += 1) {
-        const src = t * LFR_N * NUM_BINS;
-        const dst = t * dim;
+        const baseFrame = t * LFR_N - leftPad;
+        const dstBase = t * dim;
         for (let m = 0; m < LFR_M; m += 1) {
-          const from = src + m * NUM_BINS;
-          const to = dst + m * NUM_BINS;
+          const rawIdx = baseFrame + m;
+          const clampedFrame = rawIdx < 0 ? 0 : rawIdx > maxFrame ? maxFrame : rawIdx;
+          const srcOff = clampedFrame * NUM_BINS;
+          const mOff = m * NUM_BINS;
+          const dstOff = dstBase + mOff;
           for (let d = 0; d < NUM_BINS; d += 1) {
-            const idx = from + d;
-            const value = idx < sourceLen ? source[idx] : 0;
-            out[to + d] = (value + this.negMean[m * NUM_BINS + d]) * this.invStd[m * NUM_BINS + d];
+            out[dstOff + d] = (fbank[srcOff + d] + negMean[mOff + d]) * invStd[mOff + d];
           }
         }
       }

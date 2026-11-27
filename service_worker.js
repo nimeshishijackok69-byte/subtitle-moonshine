@@ -21,7 +21,7 @@ const bootCountReady = chrome.storage.session
   .catch(() => {});
 
 function mirrorState() {
-  chrome.storage.session
+  return chrome.storage.session
     .set({
       "sw.state": currentState,
       "sw.tabId": activeTabId,
@@ -39,18 +39,23 @@ function mirrorError(error) {
   return chrome.storage.session.set({ "sw.lastError": error }).catch(() => {});
 }
 
-let creatingOffscreen = null;
+let offscreenMutex = Promise.resolve();
+let creatingOffscreen = false;
 let activeTabId = null;
 let currentState = STATE.IDLE;
 let lastOverlayConfig = null;
 let lastTabMessageError = "";
 let reportedOverlayAccessTab = null;
-// Start latch: startSession has several awaits before it reaches the
-// currentState guard (getLiveOffscreenStatus), so two rapid Starts could both
-// observe IDLE and race. Set before the first await, cleared on every exit.
 let startingSession = false;
+let startEpoch = 0;
 const OFFSCREEN_KEEP_WARM_MS = 5 * 60 * 1000;
 let offscreenTeardownTimer = null;
+
+function withOffscreenLock(task) {
+  const run = offscreenMutex.then(task, task);
+  offscreenMutex = run.then(() => {}, () => {});
+  return run;
+}
 
 async function hydrateState() {
   try {
@@ -70,7 +75,6 @@ async function hydrateState() {
       if (await hasOffscreenDocument()) {
         activeTabId = savedTabId;
         currentState = savedState;
-        await getLiveOffscreenStatus();
       } else if (savedState === STATE.ERROR) {
         currentState = STATE.ERROR;
         activeTabId = null;
@@ -100,8 +104,8 @@ function scheduleOffscreenTeardown() {
       await stateReady;
       const live = await getLiveOffscreenStatus();
       if ((!live || (!live.hasSession && !live.starting && live.state === STATE.IDLE)) &&
-          currentState === STATE.IDLE) {
-        await closeOffscreenDocumentIfPresent();
+          currentState === STATE.IDLE && !startingSession) {
+        await closeOffscreenDocumentIfPresent({ onlyIfIdle: true });
       }
     } catch (err) {
       console.warn("[Offscreen] deferred teardown failed:", err);
@@ -125,8 +129,8 @@ chrome.alarms?.onAlarm?.addListener(async (alarm) => {
     await stateReady;
     const live = await getLiveOffscreenStatus();
     if ((!live || (!live.hasSession && !live.starting && live.state === STATE.IDLE)) &&
-        currentState === STATE.IDLE) {
-      await closeOffscreenDocumentIfPresent();
+        currentState === STATE.IDLE && !startingSession) {
+      await closeOffscreenDocumentIfPresent({ onlyIfIdle: true });
     }
   } catch (err) {
     console.warn("[Offscreen] deferred teardown failed:", err);
@@ -146,43 +150,45 @@ async function hasOffscreenDocument() {
   return existingContexts.length > 0;
 }
 
-async function ensureOffscreenDocument() {
-  const existingContexts = await getOffscreenContexts();
-  if (existingContexts.length > 0) {
-    return;
-  }
-
-  if (!creatingOffscreen) {
-    creatingOffscreen = chrome.offscreen.createDocument({
-      url: OFFSCREEN_DOCUMENT,
-      reasons: [chrome.offscreen.Reason.DISPLAY_MEDIA],
-      justification: "Capture shared tab audio and stream it to live transcription."
-    });
-  }
-
-  // Stale-promise guard: if createDocument() rejects, `creatingOffscreen` must
-  // be cleared or every later start re-awaits the rejected promise instead of
-  // retrying, until the service worker itself is terminated. The identity
-  // check keeps concurrent callers sharing one creation promise to null it
-  // exactly once (the winner, so a later set by a renewed caller survives).
-  const creation = creatingOffscreen;
-  try {
-    await creation;
-  } finally {
-    if (creatingOffscreen === creation) {
-      creatingOffscreen = null;
+function ensureOffscreenDocument() {
+  return withOffscreenLock(async () => {
+    const existingContexts = await getOffscreenContexts();
+    if (existingContexts.length > 0) {
+      return;
     }
-  }
+    creatingOffscreen = true;
+    try {
+      await chrome.offscreen.createDocument({
+        url: OFFSCREEN_DOCUMENT,
+        reasons: [chrome.offscreen.Reason.DISPLAY_MEDIA],
+        justification: "Capture shared tab audio and stream it to live transcription."
+      });
+    } finally {
+      creatingOffscreen = false;
+    }
+  });
 }
 
-async function closeOffscreenDocumentIfPresent() {
-  if (await hasOffscreenDocument()) {
-    await chrome.offscreen.closeDocument();
-  }
+function closeOffscreenDocumentIfPresent(options = {}) {
+  return withOffscreenLock(async () => {
+    if (options.onlyIfIdle && (currentState !== STATE.IDLE || startingSession)) {
+      return;
+    }
+    if (await hasOffscreenDocument()) {
+      await chrome.offscreen.closeDocument();
+    }
+  });
 }
 
 async function getLiveOffscreenStatus() {
   if (!(await hasOffscreenDocument())) {
+    if (!startingSession && !creatingOffscreen &&
+        currentState !== STATE.IDLE && currentState !== STATE.ERROR &&
+        currentState !== STATE.CREATING_OFFSCREEN) {
+      currentState = STATE.IDLE;
+      activeTabId = null;
+      await mirrorState();
+    }
     return null;
   }
 
@@ -219,16 +225,15 @@ function getOverlayConfig(config) {
 
 async function injectContentScript(tabId) {
   try {
-    if (OVERLAY_CSS) {
-      await chrome.scripting.insertCSS({
+    await Promise.all([
+      OVERLAY_CSS
+        ? chrome.scripting.insertCSS({ target: { tabId }, css: OVERLAY_CSS }).catch(() => {})
+        : Promise.resolve(),
+      chrome.scripting.executeScript({
         target: { tabId },
-        css: OVERLAY_CSS
-      }).catch(() => {});
-    }
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      files: ["constants.js", "contentScript.js"]
-    });
+        files: ["constants.js", "contentScript.js"]
+      })
+    ]);
   } catch (error) {
     throw new Error(`Unable to inject subtitle overlay: ${error.message}`);
   }
@@ -276,10 +281,14 @@ async function startSession({ tabId, config }) {
     };
   }
   startingSession = true;
+  const myStartEpoch = ++startEpoch;
 
   try {
     const liveStatus = await getLiveOffscreenStatus();
-    if (liveStatus?.starting || (liveStatus?.hasSession && liveStatus.state !== STATE.IDLE && liveStatus.state !== STATE.ERROR)) {
+    if (startEpoch !== myStartEpoch) {
+      return { ok: false, error: "Session start was cancelled." };
+    }
+    if (liveStatus?.hasSession && liveStatus.state !== STATE.IDLE && liveStatus.state !== STATE.ERROR) {
       return {
         ok: false,
         error: "A session is already running. Click Stop, then start again."
@@ -289,9 +298,12 @@ async function startSession({ tabId, config }) {
     // Only close if corrupted in error state; keep warm document alive
     if (currentState === STATE.ERROR || liveStatus?.state === STATE.ERROR) {
       await closeOffscreenDocumentIfPresent();
+      if (startEpoch !== myStartEpoch) {
+        return { ok: false, error: "Session start was cancelled." };
+      }
       activeTabId = null;
       currentState = STATE.IDLE;
-      mirrorState();
+      await mirrorState();
     }
 
     if (currentState !== STATE.IDLE) {
@@ -308,36 +320,43 @@ async function startSession({ tabId, config }) {
     activeTabId = tabId;
     lastOverlayConfig = overlayConfig;
     currentState = STATE.CREATING_OFFSCREEN;
-    mirrorState();
+    await mirrorState();
 
     try {
-      await ensureOverlayAndSend(tabId, {
-        type: MSG.CLEAR_ALL
-      });
-      await ensureOverlayAndSend(tabId, {
-        type: MSG.APPLY_SETTINGS,
-        config: overlayConfig
-      });
-      await ensureOffscreenDocument();
-      await chrome.runtime.sendMessage({
+      await Promise.all([
+        ensureOverlayAndSend(tabId, {
+          type: MSG.CLEAR_ALL,
+          config: overlayConfig
+        }),
+        ensureOffscreenDocument()
+      ]);
+
+      if (startEpoch !== myStartEpoch) {
+        if (currentState === STATE.CREATING_OFFSCREEN) {
+          currentState = STATE.IDLE;
+          activeTabId = null;
+          await mirrorState();
+          if (await hasOffscreenDocument().catch(() => false)) {
+            scheduleOffscreenTeardown();
+          }
+        }
+        return { ok: false, error: "Session start was cancelled." };
+      }
+
+      const startResp = await chrome.runtime.sendMessage({
         type: MSG.START,
         target: "offscreen",
         tabId,
         config
       });
+      if (startResp && startResp.ok === false) {
+        throw new Error(startResp.error || "Offscreen worker rejected start.");
+      }
     } catch (error) {
-      // Without a reset the state stays CREATING_OFFSCREEN after a failed
-      // injection or offscreen creation, and every later Start is refused as
-      // "already running" — with no offscreen document to even stop. The popup
-      // still receives the error through the run().catch response path. The
-      // guard keeps an OFFSCREEN_STATE/ERROR update that already landed from
-      // being clobbered back to IDLE.
       if (currentState === STATE.CREATING_OFFSCREEN) {
         currentState = STATE.IDLE;
         activeTabId = null;
-        mirrorState();
-        // A failed start can leave a warm offscreen document behind with no
-        // session; hand it back to the deferred-teardown path.
+        await mirrorState();
         if (await hasOffscreenDocument().catch(() => false)) {
           scheduleOffscreenTeardown();
         }
@@ -352,10 +371,11 @@ async function startSession({ tabId, config }) {
 }
 
 async function stopSession() {
+  startEpoch += 1;
   if (!(await hasOffscreenDocument())) {
     currentState = STATE.IDLE;
     activeTabId = null;
-    mirrorState();
+    await mirrorState();
     chrome.runtime.sendMessage({
       type: MSG.STATE,
       state: STATE.IDLE
@@ -431,19 +451,22 @@ async function applySettings({ tabId, config }) {
     }).catch(() => {});
   }
 
-  // A running session owns the overlay. The popup's tab is only the fallback
-  // before a session starts; preferring it would inject an idle overlay into
-  // whatever tab the popup happens to be on and leave the transcribed tab stale.
-  const targetTabId = activeTabId || tabId;
-  if (targetTabId) {
+  // A running session owns the overlay. Before a session starts, update any
+  // already-mounted overlay without forcing script injection or failing on hotword edits.
+  if (activeTabId) {
     try {
-      await ensureOverlayAndSend(targetTabId, {
+      await ensureOverlayAndSend(activeTabId, {
         type: MSG.APPLY_SETTINGS,
         config: lastOverlayConfig
       });
     } catch (error) {
       if (!hasOffscreen) throw error;
     }
+  } else if (tabId) {
+    await sendToTab(tabId, {
+      type: MSG.APPLY_SETTINGS,
+      config: lastOverlayConfig
+    });
   }
 
   return { ok: true };
@@ -499,6 +522,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return collectDiagnostics();
 
       case MSG.OFFSCREEN_STATE:
+        // Never allow a late STOPPING state transition to overwrite ERROR.
+        if (currentState === STATE.ERROR && message.state === STATE.STOPPING) {
+          return { ok: true };
+        }
         currentState = message.state;
         if (message.state === STATE.IDLE) {
           activeTabId = null;
@@ -506,25 +533,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         } else {
           cancelOffscreenTeardown();
         }
-        mirrorState();
+        await mirrorState();
+        if (message.state === STATE.ERROR) {
+          await closeOffscreenDocumentIfPresent();
+        }
         chrome.runtime.sendMessage({
           type: MSG.STATE,
           state: message.state
         }).catch(() => {});
-        if (message.state === STATE.ERROR) {
-          await closeOffscreenDocumentIfPresent();
-        }
         return { ok: true };
 
       case MSG.OFFSCREEN_ERROR: {
         cancelOffscreenTeardown();
         currentState = STATE.ERROR;
         activeTabId = null;
-        // The failure path closes the offscreen document at the end of this
-        // case, taking its ring buffer with it. The error is copied here and
-        // mirrored before that happens, or the report a user sends afterwards
-        // has no cause in it. Awaited deliberately: fire-and-forget could be
-        // cut short by the document teardown.
+        // Mirror error/state and close offscreen BEFORE broadcasting ERROR to
+        // popup so a quick user retry sees the closed document cleanly.
         const failure = {
           code: message.code || "UNKNOWN",
           message: message.message || "",
@@ -532,7 +556,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         };
         DIAG.attachError(failure.code, failure.message);
         await mirrorError(failure);
-        mirrorState();
+        await mirrorState();
+        await closeOffscreenDocumentIfPresent();
         chrome.runtime.sendMessage({
           type: MSG.STATE,
           state: STATE.ERROR
@@ -542,7 +567,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           code: message.code,
           message: message.message
         }).catch(() => {});
-        await closeOffscreenDocumentIfPresent();
         return { ok: true };
       }
 
@@ -603,8 +627,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
+  if (changeInfo.status !== "complete") return;
   await stateReady;
-  if (tabId !== activeTabId || changeInfo.status !== "complete" || currentState === STATE.IDLE || currentState === STATE.ERROR) {
+  if (tabId !== activeTabId || currentState === STATE.IDLE || currentState === STATE.ERROR) {
     return;
   }
 
@@ -625,6 +650,6 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
   await stateReady;
   if (tabId === activeTabId) {
     activeTabId = null;
-    mirrorState();
+    await mirrorState();
   }
 });

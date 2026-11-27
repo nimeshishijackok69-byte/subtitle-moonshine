@@ -43,6 +43,7 @@
 
   const OVERLAY_CSS = `
     #dg-live-subtitle-overlay {
+      --dg-styled: 1;
       position: fixed;
       left: 50%;
       right: auto;
@@ -50,6 +51,11 @@
       top: auto;
       transform: translateX(-50%);
       display: block;
+      overflow: visible;
+      opacity: 1;
+      visibility: visible;
+      contain: layout style;
+      touch-action: none;
       z-index: 2147483647;
       pointer-events: auto;
       user-select: text;
@@ -101,7 +107,9 @@
     #dg-live-subtitle-overlay .dg-toolbar {
       position: absolute;
       top: -36px;
-      right: 0;
+      left: 50%;
+      right: auto;
+      transform: translateX(-50%);
       display: flex;
       gap: 6px;
       pointer-events: none;
@@ -123,6 +131,12 @@
       opacity: 1;
       visibility: visible;
       pointer-events: auto;
+    }
+
+    #dg-live-subtitle-overlay.dg-empty .dg-toolbar {
+      opacity: 0;
+      visibility: hidden;
+      pointer-events: none;
     }
 
     #dg-live-subtitle-overlay .dg-tool-button {
