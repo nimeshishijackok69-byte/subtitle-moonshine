@@ -60,10 +60,23 @@ class PcmCaptureProcessor extends AudioWorkletProcessor {
   }
 
   processBiquad(b, x) {
-    // Direct Form II Transposed
+    // Direct Form II Transposed; reset state on non-finite input/overflow so
+    // a single corrupted sample cannot permanently wedge the stream to silence.
+    if (!Number.isFinite(x)) {
+      b.s1 = 0;
+      b.s2 = 0;
+      return 0;
+    }
     const y = b.b0 * x + b.s1;
-    b.s1 = b.b1 * x - b.a1 * y + b.s2;
-    b.s2 = b.b2 * x - b.a2 * y;
+    const s1 = b.b1 * x - b.a1 * y + b.s2;
+    const s2 = b.b2 * x - b.a2 * y;
+    if (!Number.isFinite(y) || !Number.isFinite(s1) || !Number.isFinite(s2)) {
+      b.s1 = 0;
+      b.s2 = 0;
+      return 0;
+    }
+    b.s1 = s1;
+    b.s2 = s2;
     return y;
   }
 
@@ -85,7 +98,8 @@ class PcmCaptureProcessor extends AudioWorkletProcessor {
     for (let i = 0; i < frameLength; i += 1) {
       let monoSample = 0;
       for (let channel = 0; channel < channels; channel += 1) {
-        monoSample += input[channel][i] || 0;
+        const s = input[channel][i];
+        if (Number.isFinite(s)) monoSample += s;
       }
       monoSample /= channels;
 
@@ -105,7 +119,8 @@ class PcmCaptureProcessor extends AudioWorkletProcessor {
       while (this.nextOutputIndex <= this.inputIndex) {
         const fraction = this.nextOutputIndex - (this.inputIndex - 1);
         const interpolated = this.lastMonoSample + (monoSample - this.lastMonoSample) * fraction;
-        const clamped = Math.max(-1, Math.min(1, interpolated));
+        const finite = Number.isFinite(interpolated) ? interpolated : 0;
+        const clamped = Math.max(-1, Math.min(1, finite));
         const pcmSample = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
         this.pendingBuffer[this.pendingCount] = pcmSample;
         this.pendingCount += 1;
@@ -131,8 +146,9 @@ class PcmCaptureProcessor extends AudioWorkletProcessor {
   }
 
   flushChunk() {
-    // Fast native memory copy to transferable ArrayBuffer
-    const buffer = new Int16Array(this.pendingBuffer).buffer;
+    if (this.pendingCount <= 0) return;
+    const count = Math.min(this.pendingCount, this.pendingBuffer.length);
+    const buffer = this.pendingBuffer.slice(0, count).buffer;
     this.pendingCount = 0;
     this.port.postMessage({
       type: PCM_CHUNK,

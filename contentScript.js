@@ -1,5 +1,5 @@
 (function () {
-  const { MSG } = globalThis.LIVE_SUBS || {
+  const { MSG, OVERLAY_CSS } = globalThis.LIVE_SUBS || {
     MSG: {
       APPLY_SETTINGS: "APPLY_SETTINGS",
       DG_TRANSCRIPT: "DG_TRANSCRIPT",
@@ -7,7 +7,8 @@
       CLEAR_ALL: "CLEAR_ALL",
       REMOVE_OVERLAY: "REMOVE_OVERLAY",
       RESET_OVERLAY: "RESET_OVERLAY"
-    }
+    },
+    OVERLAY_CSS: ""
   };
 
   // The committer's action vocabulary. Falling back to the literal keeps this
@@ -51,23 +52,39 @@
     lineGroup: null,
     finalNodes: [],
     position: null,
+    positionEpoch: 0,
     drag: null,
     activeLineId: null,
     activeLineText: "",
     interimTail: "",
     finalizedLineId: null,
+    finalizedLineIds: new Set(),
     dismissed: false,
     pendingRender: false,
     controlsHideTimer: null,
     lockedWidth: 0
   };
+  if (!state.finalizedLineIds) state.finalizedLineIds = new Set();
+  if (typeof state.positionEpoch !== "number") state.positionEpoch = 0;
   globalThis[STATE_KEY] = state;
 
+  function isValidPosition(pos) {
+    return Boolean(
+      pos &&
+      typeof pos === "object" &&
+      Number.isFinite(pos.centerXRatio) &&
+      Number.isFinite(pos.bottomPx)
+    );
+  }
+
   function loadSavedPosition() {
+    const epochAtStart = state.positionEpoch;
     try {
       chrome.storage?.local?.get("overlay.position", (res) => {
-        if (res && res["overlay.position"] && !state.position) {
-          state.position = res["overlay.position"];
+        if (chrome.runtime?.lastError) return;
+        const pos = res?.["overlay.position"];
+        if (state.positionEpoch === epochAtStart && isValidPosition(pos) && !state.position) {
+          state.position = { centerXRatio: pos.centerXRatio, bottomPx: pos.bottomPx };
           applyPosition();
         }
       });
@@ -88,162 +105,77 @@
     }
   }
 
-  function getMountParent() {
-    return document.fullscreenElement || document.webkitFullscreenElement || document.body || document.documentElement;
+  const UNRENDERED_FULLSCREEN_TAGS = new Set(["VIDEO", "IFRAME", "IMG", "CANVAS", "OBJECT", "EMBED"]);
+
+  function getFullscreenElement() {
+    return document.fullscreenElement || document.webkitFullscreenElement || null;
+  }
+
+  function getMountInfo() {
+    const fs = getFullscreenElement();
+    if (fs) {
+      if (UNRENDERED_FULLSCREEN_TAGS.has(fs.tagName)) {
+        return { parent: document.documentElement || document.body, usePopover: true };
+      }
+      return { parent: fs, usePopover: false };
+    }
+    return { parent: document.body || document.documentElement, usePopover: false };
   }
 
   function ensureStyle() {
-    if (document.getElementById(STYLE_ID)) {
+    if (!OVERLAY_CSS || document.getElementById(STYLE_ID)) {
       return;
+    }
+    if (state.root && typeof getComputedStyle === "function") {
+      try {
+        if (getComputedStyle(state.root).position === "fixed") return;
+      } catch {
+        // Fall through to inline <style> injection when computed styles are unavailable.
+      }
     }
 
     const style = document.createElement("style");
     style.id = STYLE_ID;
-    style.textContent = `
-      #${ROOT_ID} {
-        position: fixed;
-        left: 50%;
-        bottom: 6%;
-        top: auto;
-        transform: translateX(-50%);
-        z-index: 2147483647;
-        pointer-events: auto;
-        user-select: text;
-        -webkit-user-select: text;
-        font-family: "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Yu Gothic", "Meiryo", sans-serif;
-        font-style: normal;
-        font-weight: 500;
-        text-transform: none;
-        text-decoration: none;
-        text-indent: 0;
-        word-spacing: normal;
-        text-shadow:
-          -2px -2px 0 #000,
-           2px -2px 0 #000,
-          -2px  2px 0 #000,
-           2px  2px 0 #000,
-           0   -2px 0 #000,
-           0    2px 0 #000,
-          -2px  0   0 #000,
-           2px  0   0 #000,
-           0    3px 6px rgba(0, 0, 0, 0.85);
-        color: #ffffff;
-        text-align: center;
-        margin: 0;
-        border: none;
-        outline: none;
-        padding: 10px 16px;
-        border-radius: 8px;
-        background: rgba(0, 0, 0, 0.45);
-        width: max-content;
-        max-width: min(92vw, 1100px);
-        min-width: 120px;
-        line-height: 1.35;
-        letter-spacing: 0.03em;
-        white-space: pre-wrap;
-        box-sizing: border-box;
-        transition: opacity 120ms ease;
-      }
-
-      #${ROOT_ID}.dg-empty {
-        opacity: 0;
-        visibility: hidden;
-        pointer-events: none;
-      }
-
-      #${ROOT_ID} .dg-toolbar {
-        position: absolute;
-        top: -36px;
-        right: 0;
-        display: flex;
-        gap: 6px;
-        pointer-events: none;
-        opacity: 0;
-        visibility: hidden;
-        padding-bottom: 14px;
-        transition: opacity 120ms ease;
-      }
-
-      #${ROOT_ID}.dg-toolbar-bottom .dg-toolbar {
-        top: auto;
-        bottom: -36px;
-        padding-bottom: 0;
-        padding-top: 14px;
-      }
-
-      #${ROOT_ID}.dg-controls-open .dg-toolbar,
-      #${ROOT_ID}.dg-dragging .dg-toolbar {
-        opacity: 1;
-        visibility: visible;
-        pointer-events: auto;
-      }
-
-      #${ROOT_ID} .dg-tool-button {
-        all: unset;
-        box-sizing: border-box;
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        gap: 4px;
-        border-radius: 5px;
-        border: 1px solid rgba(255, 255, 255, 0.24);
-        background: rgba(15, 18, 20, 0.92);
-        color: #ffffff;
-        font-family: system-ui, -apple-system, sans-serif;
-        font-size: 12px;
-        font-weight: 500;
-        line-height: 1;
-        padding: 6px 10px;
-        text-shadow: none;
-        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);
-        cursor: pointer;
-        user-select: none;
-        white-space: nowrap;
-      }
-
-      #${ROOT_ID} .dg-tool-button:hover {
-        background: rgba(35, 42, 48, 0.98);
-        border-color: rgba(255, 255, 255, 0.5);
-      }
-
-      #${ROOT_ID} .dg-drag-handle {
-        cursor: grab;
-        touch-action: none;
-      }
-
-      #${ROOT_ID}.dg-dragging .dg-drag-handle {
-        cursor: grabbing;
-      }
-
-      #${ROOT_ID} .dg-line-group {
-        display: flex;
-        flex-direction: column;
-        gap: 4px;
-      }
-
-      #${ROOT_ID} .dg-final-line {
-        min-height: 1.35em;
-        pointer-events: auto;
-        cursor: text;
-      }
-
-      #${ROOT_ID} .dg-interim-tail {
-        color: #ffd54f;
-        opacity: 0.95;
-        font-style: italic;
-      }
-    `;
+    style.textContent = OVERLAY_CSS;
 
     (document.head || document.documentElement).appendChild(style);
   }
 
+  function applyFullscreenLayer(usePopover) {
+    if (!state.root) return;
+    if (usePopover) {
+      if (state.root.getAttribute("popover") !== "manual") {
+        state.root.setAttribute("popover", "manual");
+      }
+      try {
+        if (typeof state.root.showPopover === "function" && !state.root.matches?.(":popover-open")) {
+          state.root.showPopover();
+        }
+      } catch {
+        // Ignore if Popover API is unsupported or blocked in test shims.
+      }
+      return;
+    }
+    if (state.root.hasAttribute("popover")) {
+      try {
+        if (typeof state.root.hidePopover === "function" && state.root.matches?.(":popover-open")) {
+          state.root.hidePopover();
+        }
+      } catch {
+        // Ignore.
+      }
+      state.root.removeAttribute("popover");
+    }
+  }
+
   function syncMountTarget() {
     if (!state.root) return;
-    const target = getMountParent();
-    if (target && state.root.parentNode !== target) {
-      target.appendChild(state.root);
-      applyPosition();
+    const { parent, usePopover } = getMountInfo();
+    if (parent && state.root.parentNode !== parent) {
+      parent.appendChild(state.root);
     }
+    applyFullscreenLayer(usePopover);
+    applyPosition();
   }
 
   function ensureRoot() {
@@ -253,8 +185,9 @@
       return null;
     }
 
-    const mountParent = getMountParent();
-    if (state.root && mountParent?.contains(state.root)) {
+    const { parent, usePopover } = getMountInfo();
+    if (state.root && parent?.contains(state.root)) {
+      applyFullscreenLayer(usePopover);
       return state.root;
     }
 
@@ -267,8 +200,6 @@
     // while a session was live) has dead listeners. Drop it rather than adopt it.
     document.getElementById(ROOT_ID)?.remove();
 
-    ensureStyle();
-
     const root = document.createElement("div");
     root.id = ROOT_ID;
     root.className = "dg-empty";
@@ -277,7 +208,9 @@
     state.root = root;
 
     buildToolbar(root);
-    mountParent.appendChild(root);
+    parent.appendChild(root);
+    ensureStyle();
+    applyFullscreenLayer(usePopover);
     rebuildLineNodes();
     applySettings(state.settings);
     return root;
@@ -486,12 +419,13 @@
     const vh = window.innerHeight || 720;
     const rect = state.root.getBoundingClientRect ? state.root.getBoundingClientRect() : { width: 0, height: 0, top: vh * 0.9 };
 
-    if (!state.position) {
+    if (!isValidPosition(state.position)) {
+      state.position = null;
       state.root.style.left = "";
       state.root.style.top = "";
       state.root.style.bottom = "";
       state.root.style.transform = "";
-      state.root.classList.toggle("dg-toolbar-bottom", rect.top > 0 && rect.top < 40);
+      state.root.classList.toggle("dg-toolbar-bottom", rect.height > 0 && rect.top >= 0 && rect.top < 40);
       return;
     }
 
@@ -512,13 +446,41 @@
   }
 
   function resetPosition() {
+    state.positionEpoch += 1;
     state.position = null;
     savePosition(null);
     applyPosition();
   }
 
+  function cancelDrag(persist) {
+    if (!state.drag) return;
+    const { pointerId, captureTarget } = state.drag;
+    try {
+      captureTarget?.releasePointerCapture?.(pointerId);
+    } catch {
+      // Ignore if capture was already released.
+    }
+    state.drag = null;
+    state.root?.classList.remove("dg-dragging");
+    window.removeEventListener("pointermove", dragOverlay, true);
+    window.removeEventListener("pointerup", stopDrag, true);
+    window.removeEventListener("pointercancel", stopDrag, true);
+    window.removeEventListener("blur", cancelActiveDrag);
+    if (persist && isValidPosition(state.position)) {
+      savePosition(state.position);
+    }
+  }
+
+  function cancelActiveDrag() {
+    if (!state.drag) return;
+    cancelDrag(true);
+    scheduleCloseControls();
+    renderLines();
+  }
+
   function startDrag(event) {
     if (!state.root) return;
+    if (event.pointerType === "mouse" && event.button !== 0) return;
     event.preventDefault();
     event.stopPropagation();
     openControls();
@@ -546,6 +508,7 @@
     window.addEventListener("pointermove", dragOverlay, true);
     window.addEventListener("pointerup", stopDrag, true);
     window.addEventListener("pointercancel", stopDrag, true);
+    window.addEventListener("blur", cancelActiveDrag);
   }
 
   function dragOverlay(event) {
@@ -555,6 +518,7 @@
     const nextCenterX = state.drag.centerX + (event.clientX - state.drag.startX);
     const nextBottom = state.drag.bottomPx - (event.clientY - state.drag.startY);
 
+    state.positionEpoch += 1;
     state.position = {
       centerXRatio: Math.max(0, Math.min(1, nextCenterX / Math.max(1, vw))),
       bottomPx: nextBottom
@@ -564,34 +528,32 @@
 
   function stopDrag(event) {
     if (!state.drag || event.pointerId !== state.drag.pointerId) return;
-    const captureTarget = state.drag.captureTarget;
-    try {
-      captureTarget?.releasePointerCapture?.(event.pointerId);
-    } catch {
-      // Ignore if capture was already released.
-    }
-    state.drag = null;
-    state.root?.classList.remove("dg-dragging");
-    window.removeEventListener("pointermove", dragOverlay, true);
-    window.removeEventListener("pointerup", stopDrag, true);
-    window.removeEventListener("pointercancel", stopDrag, true);
-    savePosition(state.position);
+    cancelDrag(true);
     scheduleCloseControls();
     renderLines();
   }
 
   function removeOverlay() {
+    cancelDrag(false);
     if (state.controlsHideTimer) {
       clearTimeout(state.controlsHideTimer);
       state.controlsHideTimer = null;
     }
     state.lockedWidth = 0;
+    if (state.root?.hasAttribute?.("popover")) {
+      try {
+        state.root.hidePopover?.();
+      } catch {
+        // Ignore.
+      }
+    }
     state.root?.remove();
     state.root = null;
     state.lineGroup = null;
     state.finalNodes = [];
     state.activeLineId = null;
     state.activeLineText = "";
+    state.interimTail = "";
     state.dismissed = true;
   }
 
@@ -678,7 +640,7 @@
       a.href = url;
       a.download = filename;
       a.click();
-      URL.revokeObjectURL(url);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
       console.log(`[Telemetry] Exported ${this.records.length} records to ${filename}`);
     }
   };
@@ -698,7 +660,9 @@
     }
 
     if (message.type === MSG.RESET_OVERLAY) {
+      cancelDrag(false);
       state.dismissed = false;
+      state.positionEpoch += 1;
       state.position = null;
       savePosition(null);
       ensureRoot();
@@ -720,11 +684,22 @@
     }
 
     if (message.type === MSG.CLEAR_ALL) {
+      cancelDrag(false);
+      if (hasActiveSelection()) {
+        try {
+          window.getSelection?.()?.removeAllRanges?.();
+        } catch {
+          // Ignore.
+        }
+      }
       state.finalLines = [];
       state.activeLineId = null;
       state.activeLineText = "";
       state.interimTail = "";
       state.finalizedLineId = null;
+      state.finalizedLineIds.clear();
+      state.lockedWidth = 0;
+      if (state.root) state.root.style.minWidth = "";
       state.dismissed = false;
       telemetry.reset();
       ensureRoot();
@@ -741,7 +716,9 @@
       // A tick's INTERIM can still be in flight when the flush's FINAL lands,
       // because the ASR lock orders decodes but not the sends that follow them.
       // Once a line is final, nothing from that line may touch the overlay again.
-      if (message.lineId && state.finalizedLineId === message.lineId && action !== ACTION.FINAL) {
+      if (message.lineId &&
+          (state.finalizedLineId === message.lineId || state.finalizedLineIds.has(message.lineId)) &&
+          action !== ACTION.FINAL) {
         return;
       }
 
@@ -753,10 +730,21 @@
         state.interimTail = state.settings.showInterim && message.tail != null ? message.tail : "";
         renderLines();
       } else if (action === ACTION.INTERIM) {
+        if (message.lineId && state.activeLineId !== lineId) {
+          state.activeLineId = lineId;
+          state.activeLineText = "";
+        }
         state.interimTail = state.settings.showInterim ? (message.tail != null ? message.tail : text) : "";
         renderLines();
       } else if (action === ACTION.FINAL) {
-        if (message.lineId) state.finalizedLineId = message.lineId;
+        if (message.lineId) {
+          state.finalizedLineId = message.lineId;
+          state.finalizedLineIds.add(message.lineId);
+          if (state.finalizedLineIds.size > 32) {
+            const oldest = state.finalizedLineIds.values().next().value;
+            state.finalizedLineIds.delete(oldest);
+          }
+        }
         state.activeLineId = null;
         state.activeLineText = "";
         state.interimTail = "";

@@ -103,6 +103,9 @@
       this.im = new Float64Array(FFT_SIZE);
       this.power = new Float64Array(FFT_SIZE / 2 + 1);
       this.frame = new Float64Array(FRAME_LENGTH);
+      this.fbankBuf = new Float32Array(0);
+      this.lfrSourceBuf = new Float32Array(0);
+      this.lfrOutBuf = new Float32Array(0);
     }
 
     computeFeatures(samples) {
@@ -111,7 +114,11 @@
       const frameCount = 1 + Math.floor((samples.length - FRAME_LENGTH) / FRAME_SHIFT);
       if (frameCount < 1) return null;
 
-      const fbank = new Float32Array(frameCount * NUM_BINS);
+      const fbankLen = frameCount * NUM_BINS;
+      if (this.fbankBuf.length < fbankLen) {
+        this.fbankBuf = new Float32Array(fbankLen);
+      }
+      const fbank = this.fbankBuf.subarray(0, fbankLen);
       for (let frameIndex = 0; frameIndex < frameCount; frameIndex += 1) {
         const offset = frameIndex * FRAME_SHIFT;
         let mean = 0;
@@ -206,7 +213,11 @@
       }
 
       const sourceFrames = paddedCount + Math.max(0, extra);
-      const source = new Float32Array(sourceFrames * NUM_BINS);
+      const sourceLen = sourceFrames * NUM_BINS;
+      if (this.lfrSourceBuf.length < sourceLen) {
+        this.lfrSourceBuf = new Float32Array(sourceLen);
+      }
+      const source = this.lfrSourceBuf.subarray(0, sourceLen);
       for (let i = 0; i < leftPad; i += 1) {
         source.set(fbank.subarray(0, NUM_BINS), i * NUM_BINS);
       }
@@ -218,7 +229,11 @@
       }
 
       const dim = NUM_BINS * LFR_M;
-      const out = new Float32Array(lfrFrames * dim);
+      const outLen = lfrFrames * dim;
+      if (this.lfrOutBuf.length < outLen) {
+        this.lfrOutBuf = new Float32Array(outLen);
+      }
+      const out = this.lfrOutBuf.subarray(0, outLen);
       for (let t = 0; t < lfrFrames; t += 1) {
         const src = t * LFR_N * NUM_BINS;
         const dst = t * dim;
@@ -226,7 +241,8 @@
           const from = src + m * NUM_BINS;
           const to = dst + m * NUM_BINS;
           for (let d = 0; d < NUM_BINS; d += 1) {
-            const value = source[from + d] || 0;
+            const idx = from + d;
+            const value = idx < sourceLen ? source[idx] : 0;
             out[to + d] = (value + this.negMean[m * NUM_BINS + d]) * this.invStd[m * NUM_BINS + d];
           }
         }

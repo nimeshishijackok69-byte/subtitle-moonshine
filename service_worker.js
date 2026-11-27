@@ -1,17 +1,16 @@
 import "./constants.js";
 import "./diagnostics.js";
 
-const { MSG, STATE } = globalThis.LIVE_SUBS;
+const { MSG, STATE, OVERLAY_CSS } = globalThis.LIVE_SUBS;
 const DIAG = globalThis.LIVE_DIAG;
 DIAG.install();
 const OFFSCREEN_DOCUMENT = "offscreen.html";
+const OFFSCREEN_TEARDOWN_ALARM = "offscreen-teardown";
 
 // ─── Diagnostics state mirror ───────────────────────────────────────
 // MV3 terminates this worker after ~30 s idle, and currentState/activeTabId
-// live in module memory. A restarted worker therefore reports "idle" while a
-// session is still running. Mirroring to storage.session makes that desync
-// visible in a report instead of silently resetting the popup, and it keeps
-// the last error alive after the offscreen document that raised it is closed.
+// live in module memory. Mirroring to storage.session keeps the state, target
+// tab, overlay settings, and last error alive across worker restarts.
 let workerBoots = 0;
 const bootCountReady = chrome.storage.session
   .get("sw.boots")
@@ -26,6 +25,7 @@ function mirrorState() {
     .set({
       "sw.state": currentState,
       "sw.tabId": activeTabId,
+      "sw.overlayConfig": lastOverlayConfig,
       "sw.bootId": DIAG.bootId,
       "sw.updatedAt": Date.now()
     })
@@ -33,7 +33,10 @@ function mirrorState() {
 }
 
 function mirrorError(error) {
-  chrome.storage.session.set({ "sw.lastError": error }).catch(() => {});
+  if (!error) {
+    return chrome.storage.session.remove("sw.lastError").catch(() => {});
+  }
+  return chrome.storage.session.set({ "sw.lastError": error }).catch(() => {});
 }
 
 let creatingOffscreen = null;
@@ -41,6 +44,7 @@ let activeTabId = null;
 let currentState = STATE.IDLE;
 let lastOverlayConfig = null;
 let lastTabMessageError = "";
+let reportedOverlayAccessTab = null;
 // Start latch: startSession has several awaits before it reaches the
 // currentState guard (getLiveOffscreenStatus), so two rapid Starts could both
 // observe IDLE and race. Set before the first await, cleared on every exit.
@@ -48,16 +52,58 @@ let startingSession = false;
 const OFFSCREEN_KEEP_WARM_MS = 5 * 60 * 1000;
 let offscreenTeardownTimer = null;
 
+async function hydrateState() {
+  try {
+    const stored = await chrome.storage.session.get([
+      "sw.state",
+      "sw.tabId",
+      "sw.overlayConfig"
+    ]);
+    if (stored["sw.overlayConfig"] && !lastOverlayConfig) {
+      lastOverlayConfig = stored["sw.overlayConfig"];
+    }
+    if (currentState !== STATE.IDLE) return;
+
+    const savedState = stored["sw.state"];
+    const savedTabId = stored["sw.tabId"] ?? null;
+    if (savedState && savedState !== STATE.IDLE) {
+      if (await hasOffscreenDocument()) {
+        activeTabId = savedTabId;
+        currentState = savedState;
+        await getLiveOffscreenStatus();
+      } else if (savedState === STATE.ERROR) {
+        currentState = STATE.ERROR;
+        activeTabId = null;
+      } else {
+        currentState = STATE.IDLE;
+        activeTabId = null;
+        mirrorState();
+      }
+    }
+  } catch {
+    // Ignore storage failures during worker boot.
+  }
+}
+
+const stateReady = hydrateState();
+
 function scheduleOffscreenTeardown() {
   cancelOffscreenTeardown();
+  if (chrome.alarms?.create) {
+    chrome.alarms.create(OFFSCREEN_TEARDOWN_ALARM, {
+      delayInMinutes: Math.max(1, OFFSCREEN_KEEP_WARM_MS / 60000)
+    });
+    return;
+  }
   offscreenTeardownTimer = setTimeout(async () => {
     try {
-      if (currentState === STATE.IDLE) {
+      await stateReady;
+      const live = await getLiveOffscreenStatus();
+      if ((!live || (!live.hasSession && !live.starting && live.state === STATE.IDLE)) &&
+          currentState === STATE.IDLE) {
         await closeOffscreenDocumentIfPresent();
       }
     } catch (err) {
-      // The ERROR path may have closed the document between the existence check
-      // and closeDocument(). Do not leave an unhandled rejection in the worker.
       console.warn("[Offscreen] deferred teardown failed:", err);
     } finally {
       offscreenTeardownTimer = null;
@@ -66,11 +112,26 @@ function scheduleOffscreenTeardown() {
 }
 
 function cancelOffscreenTeardown() {
+  chrome.alarms?.clear?.(OFFSCREEN_TEARDOWN_ALARM)?.catch?.(() => {});
   if (offscreenTeardownTimer) {
     clearTimeout(offscreenTeardownTimer);
     offscreenTeardownTimer = null;
   }
 }
+
+chrome.alarms?.onAlarm?.addListener(async (alarm) => {
+  if (alarm?.name !== OFFSCREEN_TEARDOWN_ALARM) return;
+  try {
+    await stateReady;
+    const live = await getLiveOffscreenStatus();
+    if ((!live || (!live.hasSession && !live.starting && live.state === STATE.IDLE)) &&
+        currentState === STATE.IDLE) {
+      await closeOffscreenDocumentIfPresent();
+    }
+  } catch (err) {
+    console.warn("[Offscreen] deferred teardown failed:", err);
+  }
+});
 
 async function getOffscreenContexts() {
   const offscreenUrl = chrome.runtime.getURL(OFFSCREEN_DOCUMENT);
@@ -137,10 +198,10 @@ async function getLiveOffscreenStatus() {
 
     currentState = status.state || currentState;
     activeTabId = status.tabId || activeTabId;
-    mirrorState();
-    if (!status.hasSession && currentState === STATE.IDLE) {
+    if (!status.hasSession && !status.starting && currentState === STATE.IDLE) {
       activeTabId = null;
     }
+    mirrorState();
     return status;
   } catch {
     return null;
@@ -158,6 +219,12 @@ function getOverlayConfig(config) {
 
 async function injectContentScript(tabId) {
   try {
+    if (OVERLAY_CSS) {
+      await chrome.scripting.insertCSS({
+        target: { tabId },
+        css: OVERLAY_CSS
+      }).catch(() => {});
+    }
     await chrome.scripting.executeScript({
       target: { tabId },
       files: ["constants.js", "contentScript.js"]
@@ -200,6 +267,7 @@ async function ensureOverlayAndSend(tabId, message) {
 }
 
 async function startSession({ tabId, config }) {
+  await stateReady;
   cancelOffscreenTeardown();
   if (startingSession) {
     return {
@@ -211,7 +279,7 @@ async function startSession({ tabId, config }) {
 
   try {
     const liveStatus = await getLiveOffscreenStatus();
-    if (liveStatus?.hasSession && liveStatus.state !== STATE.IDLE && liveStatus.state !== STATE.ERROR) {
+    if (liveStatus?.starting || (liveStatus?.hasSession && liveStatus.state !== STATE.IDLE && liveStatus.state !== STATE.ERROR)) {
       return {
         ok: false,
         error: "A session is already running. Click Stop, then start again."
@@ -235,6 +303,8 @@ async function startSession({ tabId, config }) {
 
     const overlayConfig = getOverlayConfig(config);
 
+    await mirrorError(null);
+    reportedOverlayAccessTab = null;
     activeTabId = tabId;
     lastOverlayConfig = overlayConfig;
     currentState = STATE.CREATING_OFFSCREEN;
@@ -348,25 +418,32 @@ async function collectDiagnostics() {
 }
 
 async function applySettings({ tabId, config }) {
-  lastOverlayConfig = config;
-  // A running session owns the overlay. The popup's tab is only the fallback
-  // before a session starts; preferring it would inject an idle overlay into
-  // whatever tab the popup happens to be on and leave the transcribed tab stale.
-  const targetTabId = activeTabId || tabId;
+  await stateReady;
+  lastOverlayConfig = getOverlayConfig(config);
+  mirrorState();
 
-  if (targetTabId) {
-    await ensureOverlayAndSend(targetTabId, {
-      type: MSG.APPLY_SETTINGS,
-      config
-    });
-  }
-
-  if (await hasOffscreenDocument().catch(() => false)) {
+  const hasOffscreen = await hasOffscreenDocument().catch(() => false);
+  if (hasOffscreen) {
     chrome.runtime.sendMessage({
       type: MSG.APPLY_SETTINGS,
       target: "offscreen",
       config
     }).catch(() => {});
+  }
+
+  // A running session owns the overlay. The popup's tab is only the fallback
+  // before a session starts; preferring it would inject an idle overlay into
+  // whatever tab the popup happens to be on and leave the transcribed tab stale.
+  const targetTabId = activeTabId || tabId;
+  if (targetTabId) {
+    try {
+      await ensureOverlayAndSend(targetTabId, {
+        type: MSG.APPLY_SETTINGS,
+        config: lastOverlayConfig
+      });
+    } catch (error) {
+      if (!hasOffscreen) throw error;
+    }
   }
 
   return { ok: true };
@@ -378,6 +455,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   const run = async () => {
+    await stateReady;
     switch (message.type) {
       case MSG.ENSURE_OFFSCREEN:
         return {
@@ -402,13 +480,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return { ok: true };
       }
 
-      case MSG.GET_STATUS:
+      case MSG.GET_STATUS: {
         await getLiveOffscreenStatus();
+        let lastError = null;
+        if (currentState === STATE.ERROR) {
+          const stored = await chrome.storage.session.get("sw.lastError").catch(() => ({}));
+          lastError = stored["sw.lastError"] || null;
+        }
         return {
           ok: true,
           state: currentState,
-          tabId: activeTabId
+          tabId: activeTabId,
+          lastError
         };
+      }
 
       case MSG.GET_DIAGNOSTICS:
         return collectDiagnostics();
@@ -462,23 +547,33 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
 
       case MSG.OFFSCREEN_TRANSCRIPT:
-        await ensureOverlayAndSend(message.tabId, {
-          type: MSG.DG_TRANSCRIPT,
-          action: message.event.action,
-          lineId: message.event.lineId,
-          isFinal: message.event.isFinal,
-          text: message.event.text,
-          tail: message.event.tail,
-          ts: message.event.ts,
-          telemetry: message.event.telemetry
-        });
+        if (!message.tabId) return { ok: false, error: "No target tab." };
+        try {
+          await ensureOverlayAndSend(message.tabId, {
+            type: MSG.DG_TRANSCRIPT,
+            action: message.event.action,
+            lineId: message.event.lineId,
+            isFinal: message.event.isFinal,
+            text: message.event.text,
+            tail: message.event.tail,
+            ts: message.event.ts,
+            telemetry: message.event.telemetry
+          });
+          reportedOverlayAccessTab = null;
+        } catch (error) {
+          if (reportedOverlayAccessTab !== message.tabId) {
+            reportedOverlayAccessTab = message.tabId;
+            DIAG.record("sw", "warn", `overlay delivery failed for tab ${message.tabId}: ${error.message}`);
+          }
+          return { ok: false, error: error.message };
+        }
         return { ok: true };
 
       case MSG.OFFSCREEN_CLEAR_INTERIM:
         if (message.tabId) {
           await ensureOverlayAndSend(message.tabId, {
             type: MSG.CLEAR_INTERIM
-          });
+          }).catch(() => {});
         }
         return { ok: true };
 
@@ -507,8 +602,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return true;
 });
 
-chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  if (tabId !== activeTabId || changeInfo.status !== "complete" || currentState === STATE.IDLE) {
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
+  await stateReady;
+  if (tabId !== activeTabId || changeInfo.status !== "complete" || currentState === STATE.IDLE || currentState === STATE.ERROR) {
     return;
   }
 
@@ -523,4 +619,12 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
       });
     })
     .catch(() => {});
+});
+
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+  await stateReady;
+  if (tabId === activeTabId) {
+    activeTabId = null;
+    mirrorState();
+  }
 });

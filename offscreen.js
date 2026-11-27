@@ -101,9 +101,10 @@ function parseTokenTable(text) {
       const id = Number(line.slice(idx + 1));
       if (!Number.isNaN(id)) {
         map.set(id, token);
-        const clean = token.replace(/▁/g, "");
-        if (clean && !clean.startsWith("<|") && !reverse.has(clean)) {
-          reverse.set(clean, id);
+        // Preserve leading "▁" so word-initial tokens do not collide with
+        // mid-word subwords, and exclude special control tokens (<unk>/<s>/</s>/<|...|>)
+        if (id > 2 && token && !token.startsWith("<|") && !reverse.has(token)) {
+          reverse.set(token, id);
         }
       }
     }
@@ -119,16 +120,24 @@ function parseHotwordsInput(raw) {
 
 function tokenizeHotword(word) {
   if (!asrTextToId) return null;
+  const chars = Array.from(word);
   const ids = [];
   let i = 0;
-  while (i < word.length) {
+  let wordStart = true;
+  while (i < chars.length) {
+    if (/\s/.test(chars[i])) {
+      wordStart = true;
+      i += 1;
+      continue;
+    }
     let matched = false;
-    for (let len = Math.min(8, word.length - i); len >= 1; len -= 1) {
-      const sub = word.slice(i, i + len);
-      const id = (i === 0 ? asrTextToId.get("▁" + sub) : undefined) ?? asrTextToId.get(sub);
+    for (let len = Math.min(8, chars.length - i); len >= 1; len -= 1) {
+      const sub = chars.slice(i, i + len).join("");
+      const id = (wordStart ? asrTextToId.get("▁" + sub) : undefined) ?? asrTextToId.get(sub);
       if (id !== undefined) {
         ids.push(id);
         i += len;
+        wordStart = false;
         matched = true;
         break;
       }
@@ -200,13 +209,14 @@ function passesConfidenceGate(tokenCount, probSum, eventTag) {
 }
 
 function frameTokenProb(data, base, vocab, bestScore) {
+  if (!Number.isFinite(bestScore)) return 0;
   let sum = 0;
   const cutoff = bestScore - 15;
   for (let id = 0; id < vocab; id += 1) {
     const s = data[base + id];
     if (s > cutoff) sum += Math.exp(s - bestScore);
   }
-  return 1 / sum;
+  return sum > 0 ? 1 / sum : 0;
 }
 
 function hotwordBeamIds(data, startFrame, frames, vocab, trieRoot, beamWidth = 8, topK = 8, hwScale = 2.5) {
@@ -223,20 +233,23 @@ function hotwordBeamIds(data, startFrame, frames, vocab, trieRoot, beamWidth = 8
       const s = data[base + v];
       if (s > maxL) maxL = s;
     }
+    if (!Number.isFinite(maxL)) continue;
     let sumExp = 0;
     const cut = maxL - 15;
     for (let v = 0; v < vocab; v += 1) {
       const s = data[base + v];
       if (s > cut) sumExp += Math.exp(s - maxL);
     }
+    if (!(sumExp > 0) || !Number.isFinite(sumExp)) continue;
     const lse = maxL + Math.log(sumExp);
-    const blankLp = data[base] - lse;
+    const rawBlank = data[base];
+    const blankLp = Number.isFinite(rawBlank) ? rawBlank - lse : NEG_INF;
 
     topIdx.fill(-1);
     topVal.fill(-Infinity);
     for (let v = 1; v < vocab; v += 1) {
       const lp = data[base + v] - lse;
-      if (lp <= topVal[topK - 1]) continue;
+      if (!Number.isFinite(lp) || lp <= topVal[topK - 1]) continue;
       let pos = topK - 1;
       while (pos > 0 && topVal[pos - 1] < lp) {
         topVal[pos] = topVal[pos - 1];
@@ -253,6 +266,8 @@ function hotwordBeamIds(data, startFrame, frames, vocab, trieRoot, beamWidth = 8
       if (!b) {
         b = { key, parent, token, pb: NEG_INF, pnb: NEG_INF, trie, lp };
         next.set(key, b);
+      } else if (lp > b.lp) {
+        b.lp = lp;
       }
       return b;
     };
@@ -267,10 +282,13 @@ function hotwordBeamIds(data, startFrame, frames, vocab, trieRoot, beamWidth = 8
         if (c < 0) continue;
         if (c === beam.token) {
           same.pnb = logAdd(same.pnb, beam.pnb + topVal[i]);
+          if (topVal[i] > same.lp) same.lp = topVal[i];
         } else {
-          // Potential-based transition: completed hotwords reset potential to 0 so
-          // partial prefix bonuses are refunded on mismatch (zero false-trigger bias).
-          const prevPot = beam.trie.isEnd ? 0 : beam.trie.pot;
+          // Potential-based transition: completed hotwords reset potential to 0
+          // when branching outside a longer prefix match so partial bonuses are
+          // refunded on mismatch without double-boosting prefix extensions.
+          const hasChild = beam.trie.children.has(c);
+          const prevPot = (beam.trie.isEnd && !hasChild) ? 0 : beam.trie.pot;
           const nt = beam.trie.children.get(c) || trieRoot.children.get(c) || trieRoot;
           const delta = (nt.pot - prevPot) * hwScale;
           const nKey = beam.key ? `${beam.key},${c}` : String(c);
@@ -399,32 +417,44 @@ async function runAsr(pcm, options = {}) {
 function createRingBuffer(capacity) {
   return {
     data: new Int16Array(capacity),
-    writePos: 0,
+    head: 0,
+    size: 0,
     total: 0,
     append(chunk) {
       if (!chunk?.length) return;
-      if (chunk.length >= this.data.length) {
-        this.data.set(chunk.subarray(chunk.length - this.data.length));
-        this.writePos = this.data.length;
+      const cap = this.data.length;
+      if (chunk.length >= cap) {
+        this.data.set(chunk.subarray(chunk.length - cap));
+        this.head = 0;
+        this.size = cap;
         this.total += chunk.length;
         return;
       }
-      if (this.writePos + chunk.length > this.data.length) {
-        const keep = this.data.length - chunk.length;
-        this.data.copyWithin(0, this.writePos - keep, this.writePos);
-        this.writePos = keep;
+      const first = Math.min(chunk.length, cap - this.head);
+      this.data.set(chunk.subarray(0, first), this.head);
+      if (first < chunk.length) {
+        this.data.set(chunk.subarray(first), 0);
       }
-      this.data.set(chunk, this.writePos);
-      this.writePos += chunk.length;
+      this.head = (this.head + chunk.length) % cap;
+      this.size = Math.min(cap, this.size + chunk.length);
       this.total += chunk.length;
     },
     read(startAbs, endAbs) {
-      const oldest = this.total - this.writePos;
+      const cap = this.data.length;
+      const oldest = this.total - this.size;
       const start = Math.max(oldest, startAbs);
       const end = Math.min(this.total, endAbs);
       if (end <= start) return null;
-      const offset = this.writePos - (this.total - start);
-      return this.data.slice(offset, offset + (end - start));
+      const len = end - start;
+      const startOffset = (this.head - (this.total - start) + cap) % cap;
+      if (startOffset + len <= cap) {
+        return this.data.slice(startOffset, startOffset + len);
+      }
+      const out = new Int16Array(len);
+      const first = cap - startOffset;
+      out.set(this.data.subarray(startOffset));
+      out.set(this.data.subarray(0, len - first), first);
+      return out;
     }
   };
 }
@@ -441,12 +471,22 @@ function createSegmenter() {
   };
 }
 
+function clampSurrogateBoundary(str, idx) {
+  if (idx <= 0 || idx >= str.length) return idx;
+  const code = str.charCodeAt(idx);
+  const prev = str.charCodeAt(idx - 1);
+  if (code >= 0xdc00 && code <= 0xdfff && prev >= 0xd800 && prev <= 0xdbff) {
+    return idx - 1;
+  }
+  return idx;
+}
+
 function getLongestCommonPrefix(a, b) {
   if (!a || !b) return 0;
   const maxLen = Math.min(a.length, b.length);
   let i = 0;
   while (i < maxLen && a[i] === b[i]) i++;
-  return i;
+  return clampSurrogateBoundary(a, i);
 }
 
 // Lookbehind rather than a capture group: a consuming pattern only matches
@@ -589,7 +629,7 @@ async function tickAnchoredUtterance(current) {
     if (u.closed) return;
 
     const k = getLongestCommonPrefix(u.prevText, text);
-    const upTo = Math.min(k, text.length - HOLDBACK_CHARS);
+    const upTo = clampSurrogateBoundary(text, Math.min(k, Math.max(0, text.length - HOLDBACK_CHARS)));
     const agreed = getLongestCommonPrefix(text, u.committed);
 
     // Decide the committed prefix first, then derive the tail from it. Deriving
@@ -640,6 +680,17 @@ async function tickAnchoredUtterance(current) {
   }
 }
 
+function emitFinalFallback(current, u, audioSamples, captureEpoch, asrDurationMs) {
+  if (!u || session !== current || intentionalStop) return Promise.resolve();
+  return forwardTranscript(current.tabId, {
+    action: MSG.TRANSCRIPT_FINAL,
+    lineId: u.lineId,
+    text: u.committed || "",
+    isFinal: true,
+    telemetry: telemetryFor(current, audioSamples, captureEpoch, asrDurationMs)
+  });
+}
+
 function flushClosedUtterance(current, u, endAbs, options = {}) {
   if (!u) return Promise.resolve();
   u.closed = true;
@@ -651,7 +702,9 @@ function flushClosedUtterance(current, u, endAbs, options = {}) {
     : Math.min(endAbs + TAIL_PAD_SAMPLES, u.anchorStart + MAX_UTTERANCE_SAMPLES, current.ring.total);
 
   const emitFrom = Math.max(u.emitFrom ?? u.anchorStart, current.lastFlushEnd || 0);
-  if (end <= emitFrom) return Promise.resolve();
+  if (end <= emitFrom) {
+    return emitFinalFallback(current, u, end, Date.now(), 0);
+  }
 
   // Widen short windows backwards into real preceding audio in the ring (masked
   // by emitFrom) so SenseVoice receives full acoustic context instead of zeros;
@@ -663,7 +716,9 @@ function flushClosedUtterance(current, u, endAbs, options = {}) {
   current.lastFlushEnd = end;
 
   let pcm = current.ring.read(decodeStart, end);
-  if (!pcm || pcm.length === 0) return Promise.resolve();
+  if (!pcm || pcm.length === 0) {
+    return emitFinalFallback(current, u, end, Date.now(), 0);
+  }
 
   let padLeft = 0;
   if (pcm.length < MIN_UTTERANCE_SAMPLES) {
@@ -706,6 +761,7 @@ function flushClosedUtterance(current, u, endAbs, options = {}) {
       });
     } catch (err) {
       console.warn("[AnchoredCommitter] Final flush error:", err);
+      await emitFinalFallback(current, u, end, captureEpoch, 0);
     }
   })();
 }
@@ -743,9 +799,11 @@ function splitUtteranceAtValley(current, frameEnd) {
   if (!u) return;
 
   const minSearch = u.emitFrom + SPLIT_SEARCH_MIN_SAMPLES;
-  const maxSearch = frameEnd - 2 * VAD_FRAME_SAMPLES;
+  const maxSearch = Math.min(frameEnd - 2 * VAD_FRAME_SAMPLES, u.anchorStart + MAX_UTTERANCE_SAMPLES);
   const valley = findBestSplitFrame(u.vadFrames, minSearch, maxSearch);
-  const splitEnd = valley ? valley.end : frameEnd;
+  const splitEnd = valley
+    ? valley.end
+    : Math.min(frameEnd, u.anchorStart + MAX_UTTERANCE_SAMPLES);
 
   const remainingFrames = u.vadFrames.filter((f) => f.start >= splitEnd);
   current.flushTask = flushClosedUtterance(current, u, splitEnd, { isSplit: true });
@@ -861,9 +919,12 @@ async function pcmDrain(current) {
     try {
       await processPcmChunk(current, arrayBuffer);
     } catch (error) {
-      if (session === current && !intentionalStop) {
-        reportError("AUDIO_PROCESS_ERROR", error.message);
+      current.pcmQueue.length = 0;
+      if (session === current && !intentionalStop && !current.stopping) {
+        await reportError("AUDIO_PROCESS_ERROR", error?.message || "Audio processing failed");
+        void stopSession({ finalState: STATE.ERROR });
       }
+      break;
     }
   }
   current.pcmRunning = false;
@@ -879,34 +940,43 @@ async function processPcmChunk(current, arrayBuffer) {
   DIAG.bump("pcm.chunks");
   DIAG.set("pcm.queueDepth", current.pcmQueue.length);
 
-  if (current.vadPending.length) {
-    const merged = new Int16Array(current.vadPending.length + int16.length);
-    merged.set(current.vadPending);
-    merged.set(int16, current.vadPending.length);
-    current.vadPending = merged;
-  } else {
-    current.vadPending = int16;
+  const needed = current.vadLen + int16.length;
+  if (current.vadBuf.length < needed) {
+    const grown = new Int16Array(Math.max(needed, current.vadBuf.length * 2));
+    grown.set(current.vadBuf.subarray(0, current.vadLen));
+    current.vadBuf = grown;
   }
+  current.vadBuf.set(int16, current.vadLen);
+  current.vadLen = needed;
 
-  while (current.vadPending.length >= VAD_FRAME_SAMPLES) {
-    let sumSq = 0;
-    for (let i = 0; i < VAD_FRAME_SAMPLES; i += 1) {
-      const s = current.vadPending[i] / 32768;
-      vadFloatFrame[i] = s;
-      sumSq += s * s;
+  let vadOff = 0;
+  try {
+    while (current.vadLen - vadOff >= VAD_FRAME_SAMPLES) {
+      let sumSq = 0;
+      for (let i = 0; i < VAD_FRAME_SAMPLES; i += 1) {
+        const s = current.vadBuf[vadOff + i] / 32768;
+        vadFloatFrame[i] = s;
+        sumSq += s * s;
+      }
+      const rms = Math.sqrt(sumSq / VAD_FRAME_SAMPLES);
+      vadOff += VAD_FRAME_SAMPLES;
+
+      const probability = await runVad(vadFloatFrame);
+      if (session !== current || intentionalStop || current.stopping) return;
+
+      DIAG.bump(probability >= VAD_SPEECH_THRESHOLD ? "vad.speechFrames" : "vad.idleFrames");
+      DIAG.set("vad.lastP", Math.round(probability * 1000) / 1000);
+
+      const frameStart = current.vadAbs;
+      current.vadAbs += VAD_FRAME_SAMPLES;
+      handleVadFrame(current, probability, rms, frameStart, current.vadAbs);
     }
-    const rms = Math.sqrt(sumSq / VAD_FRAME_SAMPLES);
-    current.vadPending = current.vadPending.subarray(VAD_FRAME_SAMPLES);
-
-    const probability = await runVad(vadFloatFrame);
-    if (session !== current || intentionalStop || current.stopping) return;
-
-    DIAG.bump(probability >= VAD_SPEECH_THRESHOLD ? "vad.speechFrames" : "vad.idleFrames");
-    DIAG.set("vad.lastP", Math.round(probability * 1000) / 1000);
-
-    const frameStart = current.vadAbs;
-    current.vadAbs += VAD_FRAME_SAMPLES;
-    handleVadFrame(current, probability, rms, frameStart, current.vadAbs);
+  } finally {
+    const rem = current.vadLen - vadOff;
+    if (rem > 0 && vadOff > 0) {
+      current.vadBuf.copyWithin(0, vadOff, current.vadLen);
+    }
+    current.vadLen = rem;
   }
 }
 
@@ -927,6 +997,7 @@ function getStatus() {
     ok: true,
     state: offscreenState,
     hasSession: Boolean(session),
+    starting: pendingStarts > 0,
     tabId: session?.tabId || null,
     droppedChunks: session?.pcmDropped || 0
   };
@@ -951,180 +1022,206 @@ async function disposeSessionResources(cur) {
   for(const t of cur.displayStream?.getTracks()||[]) t.stop();
 }
 
-async function stopSession(options={}) {
-  // Bump first, before any await or the null-session early return: this is
-  // what an in-flight startSession() keys on. Increment even when there is
-  // no session — a Stop pressed during the start prelude is exactly the
-  // (session === null) case this epoch exists to signal.
-  sessionEpoch += 1;
-  const finalState = options.finalState || STATE.IDLE;
-  if(!session) { await setState(finalState); return; }
-
-  const cur = session;
-  cur.stopping = true;
-  await setState(STATE.STOPPING);
-
-  // A decode must never be able to wedge teardown: a stalled ONNX call would
-  // otherwise leave `session` non-null and every later START blocked behind it.
-  const bounded = (task) => Promise.race([
-    task.catch(() => {}),
-    new Promise((resolve) => setTimeout(resolve, ASR_STOP_TIMEOUT_MS))
-  ]);
-
-  // A silence-triggered flush may already be decoding. Await it so its FINAL is
-  // not orphaned, then flush anything still open.
-  if (cur.flushTask) {
-    await bounded(cur.flushTask);
-    cur.flushTask = null;
-  }
-
-  // Authoritative flush of active utterance on stop
-  if (finalState === STATE.IDLE && cur.segmenter?.speechActive) {
-    await bounded(finishUtterance(cur, cur.ring.total));
-  }
-
-  intentionalStop = true;
-  await disposeSessionResources(cur);
-  if(session===cur) session = null;
-  await sendMsg({type:MSG.OFFSCREEN_CLEAR_INTERIM, tabId:cur.tabId});
-  await setState(finalState);
-}
-
-// Capture-start latch: loadVad/loadAsr take seconds, during which `session`
-// is still null — a second START would run a second capture picker and the
-// loser's stream would never be disposed. Set before the first await,
-// cleared on every exit.
-let startingCapture = false;
-
-// Stop-during-start abort: `session` stays null for the whole slow prelude
-// (model load, capture picker, worklet module load), so an in-flight start is
-// invisible to stopSession()'s own guard. Every stopSession() bumps this
-// counter first; startSession snaps the epoch after its own prelude-stop and
-// re-checks at each await boundary, bailing out and disposing resources if
-// the user pressed Stop in the meantime.
+let startInFlight = null;
+let stopInFlight = null;
+let startRequestId = 0;
+let pendingStarts = 0;
 let sessionEpoch = 0;
 
-async function startSession(tabId, config) {
-  if (startingCapture) return;
-  startingCapture = true;
+async function stopSession(options = {}) {
+  // Bump first, before any await or the null-session early return: this is
+  // what an in-flight startSession() keys on.
+  sessionEpoch += 1;
+  if (stopInFlight) {
+    await stopInFlight;
+    return;
+  }
 
-  try {
-    if(session) await stopSession();
-    intentionalStop=false;
-    // A previous failure's error would otherwise dominate the next report and
-    // send every diagnosis down the wrong path.
-    DIAG.clearError();
-    // Snap AFTER the stale-session stop above: any stopSession() from here on
-    // (a user Stop during model load or capture) bumps the epoch and aborts
-    // this start at the next check.
-    const myEpoch = sessionEpoch;
-    const epochAbort = new Error("STOP_DURING_START");
-    epochAbort.epochAbort = true;
-
-    let displayStream=null, audioContext=null;
-    try {
-    // Load VAD
-    await setState(STATE.LOADING_VAD);
-    await loadVad(); resetVadState();
-    if(sessionEpoch!==myEpoch) throw epochAbort;
-
-    // Load SenseVoice model
-    await setState(STATE.LOADING_MODEL);
-    await loadAsr();
-    if(sessionEpoch!==myEpoch) throw epochAbort;
-
-    await setState(STATE.AWAITING_CAPTURE_PERMISSION);
-    await sendMsg({type:MSG.OFFSCREEN_CLEAR_ALL, tabId});
-    if(sessionEpoch!==myEpoch) throw epochAbort;
-
-    displayStream = await navigator.mediaDevices.getDisplayMedia({
-      video: { displaySurface: "browser" },
-      audio: { echoCancellation:false, noiseSuppression:false, autoGainControl:false },
-      selfBrowserSurface:"exclude", systemAudio:"include", surfaceSwitching:"include"
-    });
-
-    const [audioTrack] = displayStream.getAudioTracks();
-    const [videoTrack] = displayStream.getVideoTracks();
-    if(/live subtitle audio worker|chrome-extension/i.test(`${videoTrack?.label} ${audioTrack?.label}`)) {
-      displayStream.getTracks().forEach(t=>t.stop());
-      await reportError("WRONG_CAPTURE_SOURCE","Choose the tab you want subtitled"); await setState(STATE.IDLE); return;
-    }
-    if(!audioTrack) { displayStream.getTracks().forEach(t=>t.stop());
-      await reportError("NO_AUDIO_TRACK","No shared audio"); await setState(STATE.IDLE); return; }
-
-    await setState(STATE.CAPTURING);
-    audioContext = new AudioContext();
-    await audioContext.audioWorklet.addModule(chrome.runtime.getURL("audio-worklet.js"));
-    if(sessionEpoch!==myEpoch) throw epochAbort;
-    // Only synchronous work between this check and `session = {...}`, so a
-    // stop arriving later is served by the normal stop path (session non-null).
-    const captureStream = new MediaStream([audioTrack]);
-    const sourceNode = audioContext.createMediaStreamSource(captureStream);
-    const workletNode = new AudioWorkletNode(audioContext, "pcm-capture-processor", {
-      numberOfInputs:1, numberOfOutputs:1, outputChannelCount:[1],
-      processorOptions: {
-        targetSampleRate:TARGET_SAMPLE_RATE, chunkMs:config.chunkMs||25
-      }
-    });
-    const silenceNode = audioContext.createGain(); silenceNode.gain.value = 0;
-    sourceNode.connect(workletNode); workletNode.connect(silenceNode);
-    silenceNode.connect(audioContext.destination);
-
-    session = {
-      tabId, config, displayStream, captureStream, audioContext, sourceNode, workletNode, silenceNode,
-      ring: createRingBuffer(RING_BUFFER_SAMPLES),
-      segmenter: createSegmenter(),
-      vadPending: new Int16Array(0),
-      vadAbs: 0,
-      // Chunk pipeline: array-backed queue drained strictly serially by
-      // pcmDrain(). chunkSamples mirrors the worklet's per-chunk size at
-      // TARGET_SAMPLE_RATE, so a dropped chunk can charge its wall-clock
-      // duration into droppedAudioSamples for the telemetry mapping.
-      pcmQueue: [],
-      pcmRunning: false,
-      pcmDropped: 0,
-      droppedAudioSamples: 0,
-      chunkSamples: Math.max(160, Math.round(TARGET_SAMPLE_RATE * (config.chunkMs || 25) / 1000)),
-      // Epoch of the first captured PCM chunk. Audio position 0 of the ring
-      // buffer maps to this wall-clock instant. Chunk drops punch straight-
-      // time holes into the ring, so telemetryFor charges dropped-audio time
-      // into audioSeconds — keeping (streamStartEpoch + audioSeconds*1000)
-      // equal to the wall clock of the sound being decoded, and every
-      // downstream latency metric truthful even under overload.
-      streamStartEpoch: 0,
-      asrChain: Promise.resolve(),
-      hotwordTrie: buildHotwordTrie(config?.hotwords),
-      utterance: null,
-      flushTask: null,
-      lastFlushEnd: 0,
-      stopping: false
-    };
-    const current = session;
-    DIAG.set("session.chunkMs", config.chunkMs || 25);
-
-    audioTrack.addEventListener("ended", () => { if(session===current && !intentionalStop) stopSession(); });
-    workletNode.port.onmessage = (e) => {
-      if(e.data?.type!==MSG.PCM_CHUNK || session!==current) return;
-      enqueuePcm(current, e.data.buffer);
-    };
-
-    await setState(STATE.LISTENING);
-    if(current.audioContext.state==="suspended") await current.audioContext.resume();
-  } catch(err) {
-    if(!session) await disposeSessionResources({displayStream, audioContext});
-    if(err?.epochAbort) {
-      // The user's Stop bumped the epoch and already ran stopSession() (state
-      // reset to IDLE, no error banner) while this start was still in its
-      // prelude. Resources are disposed above; nothing else to report.
+  const runStop = (async () => {
+    const finalState = options.finalState || STATE.IDLE;
+    if (!session) {
+      await setState(finalState);
       return;
     }
-    await stopSession();
-    if(err?.name==="NotAllowedError") { await reportError("CAPTURE_DENIED","Permission denied"); return; }
-    if(err?.name==="NotFoundError") { await reportError("NO_AUDIO_TRACK","No shared audio"); return; }
-    await reportError("START_FAILED", err?.message || "Unable to start");
-  }
+
+    const cur = session;
+    cur.stopping = true;
+    await setState(STATE.STOPPING);
+
+    // A decode must never be able to wedge teardown: a stalled ONNX call would
+    // otherwise leave `session` non-null and every later START blocked behind it.
+    const bounded = (task) => Promise.race([
+      task.catch(() => {}),
+      new Promise((resolve) => setTimeout(resolve, ASR_STOP_TIMEOUT_MS))
+    ]);
+
+    // A silence-triggered flush may already be decoding. Await it so its FINAL is
+    // not orphaned, then flush anything still open.
+    if (cur.flushTask) {
+      await bounded(cur.flushTask);
+      cur.flushTask = null;
+    }
+
+    // Authoritative flush of active utterance on stop
+    if (finalState === STATE.IDLE && cur.segmenter?.speechActive) {
+      await bounded(finishUtterance(cur, cur.ring.total));
+    }
+
+    intentionalStop = true;
+    await disposeSessionResources(cur);
+    if (session === cur) session = null;
+    await sendMsg({ type: MSG.OFFSCREEN_CLEAR_INTERIM, tabId: cur.tabId });
+    await setState(finalState);
+  })();
+
+  stopInFlight = runStop;
+  try {
+    await runStop;
   } finally {
-    startingCapture = false;
+    if (stopInFlight === runStop) stopInFlight = null;
+  }
+}
+
+async function startSession(tabId, config) {
+  const requestId = ++startRequestId;
+  pendingStarts += 1;
+  sessionEpoch += 1;
+
+  try {
+    if (startInFlight) {
+      await startInFlight.catch(() => {});
+    }
+    if (requestId !== startRequestId) return;
+    if (stopInFlight) {
+      await stopInFlight.catch(() => {});
+    }
+    if (requestId !== startRequestId) return;
+
+    const runStart = (async () => {
+      if (session) await stopSession();
+      if (requestId !== startRequestId) return;
+
+      intentionalStop = false;
+      DIAG.clearError();
+      const myEpoch = sessionEpoch;
+      const epochAbort = new Error("STOP_DURING_START");
+      epochAbort.epochAbort = true;
+
+      let displayStream = null, audioContext = null;
+      try {
+        await setState(STATE.LOADING_VAD);
+        await loadVad(); resetVadState();
+        if (sessionEpoch !== myEpoch) throw epochAbort;
+
+        await setState(STATE.LOADING_MODEL);
+        await loadAsr();
+        if (sessionEpoch !== myEpoch) throw epochAbort;
+
+        await setState(STATE.AWAITING_CAPTURE_PERMISSION);
+        await sendMsg({ type: MSG.OFFSCREEN_CLEAR_ALL, tabId });
+        if (sessionEpoch !== myEpoch) throw epochAbort;
+
+        displayStream = await navigator.mediaDevices.getDisplayMedia({
+          video: { displaySurface: "browser" },
+          audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+          selfBrowserSurface: "exclude", systemAudio: "include", surfaceSwitching: "include"
+        });
+        if (sessionEpoch !== myEpoch) {
+          displayStream.getTracks().forEach((t) => t.stop());
+          throw epochAbort;
+        }
+
+        const [audioTrack] = displayStream.getAudioTracks();
+        const [videoTrack] = displayStream.getVideoTracks();
+        if (/live subtitle audio worker|chrome-extension/i.test(`${videoTrack?.label} ${audioTrack?.label}`)) {
+          displayStream.getTracks().forEach((t) => t.stop());
+          await reportError("WRONG_CAPTURE_SOURCE", "Choose the tab you want subtitled");
+          return;
+        }
+        if (!audioTrack) {
+          displayStream.getTracks().forEach((t) => t.stop());
+          await reportError("NO_AUDIO_TRACK", "No shared audio");
+          return;
+        }
+
+        await setState(STATE.CAPTURING);
+        audioContext = new AudioContext();
+        await audioContext.audioWorklet.addModule(chrome.runtime.getURL("audio-worklet.js"));
+        if (sessionEpoch !== myEpoch) throw epochAbort;
+
+        const captureStream = new MediaStream([audioTrack]);
+        const sourceNode = audioContext.createMediaStreamSource(captureStream);
+        const workletNode = new AudioWorkletNode(audioContext, "pcm-capture-processor", {
+          numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1],
+          processorOptions: {
+            targetSampleRate: TARGET_SAMPLE_RATE, chunkMs: config.chunkMs || 25
+          }
+        });
+        const silenceNode = audioContext.createGain(); silenceNode.gain.value = 0;
+        sourceNode.connect(workletNode); workletNode.connect(silenceNode);
+        silenceNode.connect(audioContext.destination);
+
+        const chunkSamples = Math.max(160, Math.round(TARGET_SAMPLE_RATE * (config.chunkMs || 25) / 1000));
+        session = {
+          tabId, config, displayStream, captureStream, audioContext, sourceNode, workletNode, silenceNode,
+          ring: createRingBuffer(RING_BUFFER_SAMPLES),
+          segmenter: createSegmenter(),
+          vadBuf: new Int16Array(Math.max(VAD_FRAME_SAMPLES * 4, chunkSamples * 2)),
+          vadLen: 0,
+          vadAbs: 0,
+          pcmQueue: [],
+          pcmRunning: false,
+          pcmDropped: 0,
+          droppedAudioSamples: 0,
+          chunkSamples,
+          streamStartEpoch: 0,
+          asrChain: Promise.resolve(),
+          hotwordTrie: buildHotwordTrie(config?.hotwords),
+          utterance: null,
+          flushTask: null,
+          lastFlushEnd: 0,
+          stopping: false
+        };
+        const current = session;
+        DIAG.set("session.chunkMs", config.chunkMs || 25);
+
+        audioTrack.addEventListener("ended", () => { if (session === current && !intentionalStop) stopSession(); });
+        audioContext.addEventListener("statechange", () => {
+          if (session === current && !intentionalStop && !current.stopping &&
+              (audioContext.state === "suspended" || audioContext.state === "interrupted")) {
+            DIAG.mark("audio", `context ${audioContext.state}; resuming`);
+            audioContext.resume().catch((e) => console.warn("[AudioContext] resume failed:", e));
+          }
+        });
+        workletNode.port.onmessage = (e) => {
+          if (e.data?.type !== MSG.PCM_CHUNK || session !== current) return;
+          enqueuePcm(current, e.data.buffer);
+        };
+
+        await setState(STATE.LISTENING);
+        if (session === current && !current.stopping && current.audioContext.state === "suspended") {
+          await current.audioContext.resume();
+        }
+      } catch (err) {
+        if (!session) await disposeSessionResources({ displayStream, audioContext });
+        if (err?.epochAbort || sessionEpoch !== myEpoch) {
+          return;
+        }
+        await stopSession();
+        if (err?.name === "NotAllowedError") { await reportError("CAPTURE_DENIED", "Permission denied"); return; }
+        if (err?.name === "NotFoundError") { await reportError("NO_AUDIO_TRACK", "No shared audio"); return; }
+        await reportError("START_FAILED", err?.message || "Unable to start");
+      }
+    })();
+
+    startInFlight = runStart;
+    try {
+      await runStart;
+    } finally {
+      if (startInFlight === runStart) startInFlight = null;
+    }
+  } finally {
+    pendingStarts -= 1;
   }
 }
 

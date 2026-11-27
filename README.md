@@ -52,7 +52,7 @@ popup → service worker → offscreen document → AudioWorklet → 16 kHz PCM
 - **SenseVoice** runs a JS fbank frontend (80 bins, LFR 7/6, CMVN) and greedy CTC decode with `language=ja`, `text_norm` on. Output is NFKC-normalised, tags stripped, and Japanese inter-character spaces removed.
 - **Committer** re-decodes the anchored window every 500 ms while speech continues, commits only the longest common prefix minus a 4-character holdback, and rewrites one line per utterance (`GROW` / `REVISE` / `INTERIM` / `FINAL`). Every decode is serialised through one promise chain so a late tick can't overwrite a finished line.
 - **Backpressure** caps the PCM queue at 20 chunks (~0.5 s). If VAD falls behind realtime the oldest queued chunk is dropped, because stale audio cannot reduce lag by being decoded later; the dropped duration is charged into the latency telemetry so `audioLagMs` stays truthful.
-- **Service worker** relays messages, re-injects the overlay when a tab finishes navigating, and schedules offscreen teardown 5 minutes after the session goes idle. That timer is a `setTimeout`, which does not survive service-worker termination (~30 s idle), so the document can outlive the intended window — a known gap, not a guarantee.
+- **Service worker** relays messages, re-injects the overlay when a tab finishes navigating (persisting state and overlay settings across MV3 worker restarts), and schedules offscreen teardown via `chrome.alarms` 5 minutes after the session goes idle.
 
 ## Files
 

@@ -100,14 +100,15 @@ function updateStartState() {
   els.stop.disabled = !isBusy;
 }
 
-function setStatus(state, detail = "") {
+function setStatus(state, detail = "", options = {}) {
   const text = detail || STATUS_LABELS[state] || state;
+  const showAsError = state === STATE.ERROR || Boolean(options.isError);
   els.statusDot.dataset.state = state;
   els.statusText.textContent = text;
   els.statusText.title = text;
-  els.statusText.classList.toggle("is-error", state === STATE.ERROR);
+  els.statusText.classList.toggle("is-error", showAsError);
   els.statusDot.classList.toggle("live", state === STATE.LISTENING);
-  els.statusDot.classList.toggle("error", state === STATE.ERROR);
+  els.statusDot.classList.toggle("error", showAsError);
   updateStartState();
 }
 
@@ -128,16 +129,20 @@ async function persistOverlaySettings() {
   await storageSet(getPersistedOverlaySettings());
 }
 
-async function persistAllSettings() {
-  await storageSet(getPersistedOverlaySettings());
-  return true;
-}
-
 function scheduleOverlaySettingsSave() {
   window.clearTimeout(overlaySaveTimer);
   overlaySaveTimer = window.setTimeout(() => {
+    overlaySaveTimer = null;
     persistOverlaySettings().catch((error) => setStatus(STATE.ERROR, error.message));
   }, 200);
+}
+
+function flushPendingSettingsSave() {
+  if (overlaySaveTimer) {
+    window.clearTimeout(overlaySaveTimer);
+    overlaySaveTimer = null;
+    persistOverlaySettings().catch(() => {});
+  }
 }
 
 async function applyOverlaySettingsToTab() {
@@ -158,10 +163,8 @@ async function applyOverlaySettingsToTab() {
 
 async function startSession() {
   const config = getSessionConfig();
-  const saved = await persistAllSettings();
-  if (!saved) {
-    return;
-  }
+  flushPendingSettingsSave();
+  await persistOverlaySettings();
 
   const tabId = await getActiveTabId();
   setStatus(STATE.CREATING_OFFSCREEN);
@@ -470,7 +473,20 @@ async function load() {
 
   const status = await chrome.runtime.sendMessage({ type: MSG.GET_STATUS });
   if (status?.ok) {
-    setStatus(status.state || STATE.IDLE);
+    const state = status.state || STATE.IDLE;
+    if (state === STATE.ERROR) {
+      let lastError = status.lastError || null;
+      if (!lastError) {
+        const stored = await chrome.storage.session.get("sw.lastError").catch(() => ({}));
+        lastError = stored["sw.lastError"] || null;
+      }
+      const detail = lastError
+        ? (lastError.code ? `[${lastError.code}] ${lastError.message}` : lastError.message)
+        : "";
+      setStatus(STATE.ERROR, detail);
+    } else {
+      setStatus(state);
+    }
   }
 
 }
@@ -483,13 +499,19 @@ for (const input of [els.lines, els.fontSize, els.opacity, els.showInterim]) {
 
 if (els.hotwords) {
   els.hotwords.addEventListener("input", () => {
-    scheduleOverlaySettingsSave();
+    persistOverlaySettings().catch(() => {});
     window.clearTimeout(hotwordsApplyTimer);
     hotwordsApplyTimer = window.setTimeout(() => {
+      hotwordsApplyTimer = null;
       applyOverlaySettingsToTab().catch((error) => setStatus(STATE.ERROR, error.message));
     }, 300);
   });
 }
+
+window.addEventListener("pagehide", flushPendingSettingsSave);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") flushPendingSettingsSave();
+});
 
 if (els.resetOverlay) {
   els.resetOverlay.addEventListener("click", async () => {
@@ -514,7 +536,14 @@ els.start.addEventListener("click", () => {
   // awaits storage/tab IPC calls before the first status update, leaving a
   // double-click window that would race two concurrent sessions.
   els.start.disabled = true;
-  startSession().catch((error) => setStatus(STATE.ERROR, error.message));
+  startSession().catch(async (error) => {
+    const live = await chrome.runtime.sendMessage({ type: MSG.GET_STATUS }).catch(() => null);
+    if (live?.ok && ACTIVE_SESSION_STATES.has(live.state)) {
+      setStatus(live.state, error.message, { isError: true });
+      return;
+    }
+    setStatus(STATE.ERROR, error.message);
+  });
 });
 
 els.stop.addEventListener("click", () => {
